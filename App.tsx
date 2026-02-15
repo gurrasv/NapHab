@@ -1,6 +1,7 @@
 import 'react-native-gesture-handler';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { StatusBar } from 'expo-status-bar';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { MaterialCommunityIcons, MaterialIcons } from '@expo/vector-icons';
 import { DarkTheme as NavigationDarkTheme, NavigationContainer } from '@react-navigation/native';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
@@ -406,12 +407,14 @@ function HomeScreen({
   onEditExercise: (exercise: Exercise) => void;
   onDeleteExercise: (exercise: Exercise) => void;
 }) {
+  const insets = useSafeAreaInsets();
 
   const updateExercise = (id: string, patch: Partial<Exercise>) =>
     setExercises((prev) => prev.map((exercise) => (exercise.id === id ? { ...exercise, ...patch } : exercise)));
 
   return (
-    <View style={styles.screen}>
+    <View style={[styles.screen, { paddingTop: insets.top }]}>  
+      <Text style={styles.screenTitle}>TrackWell</Text>
       {exercises.length === 0 ? (
         <View style={styles.emptyState}>
           <Text style={styles.emptyTitle}>Inga övningar ännu</Text>
@@ -512,6 +515,7 @@ function TrainingScreen({
   gymLibraryExercises: LibraryExercise[];
   setGymLibraryExercises: React.Dispatch<React.SetStateAction<LibraryExercise[]>>;
 }) {
+  const insets = useSafeAreaInsets();
   const gymSheetMaxDrag = Math.round(Dimensions.get('window').height * 0.92);
   const [view, setView] = useState<'home' | 'session' | 'builder' | 'saved' | 'historyDetail'>('home');
   const [libraryMode, setLibraryMode] = useState<'session' | 'builder' | null>(null);
@@ -928,7 +932,8 @@ function TrainingScreen({
   };
 
   return (
-    <View style={styles.screen}>
+    <View style={[styles.screen, { paddingTop: insets.top }]}>
+      <Text style={styles.screenTitleSmall}>Träning</Text>
       {view === 'home' ? (
         <ScrollView contentContainerStyle={styles.listContent}>
           {sessionStartedAtIso ? (
@@ -1310,6 +1315,7 @@ function AnalysisScreen({
   exercises: Exercise[];
   logs: ExerciseLog[];
 }) {
+  const insets = useSafeAreaInsets();
   const days = useMemo(() => buildTimelineDays(), []);
   const [menuOpen, setMenuOpen] = useState(false);
   const [selected, setSelected] = useState<string[]>(exercises.map((exercise) => exercise.id));
@@ -1355,7 +1361,8 @@ function AnalysisScreen({
   );
 
   return (
-    <View style={styles.screen}>
+    <View style={[styles.screen, { paddingTop: insets.top }]}>
+      <Text style={styles.screenTitleSmall}>Analys</Text>
       <View style={styles.dropdownRow}>
         <Button mode="outlined" icon="filter-variant" onPress={() => setMenuOpen(true)}>
           Välj övningar
@@ -1624,6 +1631,7 @@ function DiaryScreen({
   setSeries: React.Dispatch<React.SetStateAction<PainSeries[]>>;
   onAddSeries: () => void;
 }) {
+  const insets = useSafeAreaInsets();
   const [activeSeriesId, setActiveSeriesId] = useState<string | null>(series[0]?.id ?? null);
   const [selectedEntryId, setSelectedEntryId] = useState<string | null>(null);
   const [viewMode, setViewMode] = useState<DiaryViewMode>('dag');
@@ -1711,7 +1719,8 @@ function DiaryScreen({
   };
 
   return (
-    <View style={styles.screen}>
+    <View style={[styles.screen, { paddingTop: insets.top }]}>
+      <Text style={styles.screenTitleSmall}>Dagbok</Text>
       <ScrollView
         ref={diaryScrollRef}
         contentContainerStyle={styles.listContent}
@@ -2402,9 +2411,7 @@ export default function App() {
           <StatusBar style="light" />
           <Tab.Navigator
             screenOptions={({ route }) => ({
-              headerTitleAlign: 'center',
-              headerStyle: { backgroundColor: '#151D26' },
-              headerTintColor: '#E3EAF2',
+              headerShown: false,
               tabBarStyle: { backgroundColor: '#151D26', borderTopColor: '#24313E' },
               tabBarActiveTintColor: '#81C784',
               tabBarInactiveTintColor: '#90A4B8',
@@ -2418,7 +2425,7 @@ export default function App() {
           >
             <Tab.Screen
               name="Hem"
-              options={{ title: 'NapHab' }}
+              options={{ title: 'Hem' }}
             >
               {() => (
                 <HomeScreen
@@ -2912,6 +2919,8 @@ export default function App() {
 
 const styles = StyleSheet.create({
   screen: { flex: 1, backgroundColor: '#0F1419' },
+  screenTitle: { color: '#E3EAF2', fontSize: 32, fontWeight: '800', paddingHorizontal: 16, paddingTop: 14, paddingBottom: 6 },
+  screenTitleSmall: { color: '#E3EAF2', fontSize: 24, fontWeight: '700', paddingHorizontal: 16, paddingTop: 10, paddingBottom: 4 },
   listContent: { padding: 12, gap: 12, paddingBottom: 120 },
   exerciseCard: {
     borderRadius: 16,
