@@ -1973,7 +1973,7 @@ export default function App() {
   const [newSeriesName, setNewSeriesName] = useState('');
   const [libraryVisible, setLibraryVisible] = useState(false);
   const [libraryQuery, setLibraryQuery] = useState('');
-  const [libraryFilters, setLibraryFilters] = useState<string[]>([]);
+  const [libraryFilter, setLibraryFilter] = useState<string | null>(null);
   const [wizardExercise, setWizardExercise] = useState<LibraryExercise | null>(null);
   const [wizardMode, setWizardMode] = useState<WizardMode>('create');
   const [wizardExerciseId, setWizardExerciseId] = useState<string | null>(null);
@@ -2139,6 +2139,13 @@ export default function App() {
             // Ignore snooze scheduling failures
           }
         }
+        if (actionId === 'done' || actionId === 'snooze') {
+          try {
+            await Notifications.dismissNotificationAsync(response.notification.request.identifier);
+          } catch {
+            // Ignore dismiss failures on some platforms/states
+          }
+        }
         // DEFAULT_ACTION_IDENTIFIER = user tapped the notification body → app opens normally
       },
     );
@@ -2155,6 +2162,7 @@ export default function App() {
           ...prev,
           { exerciseId: data.exerciseId!, atIso: new Date().toISOString() },
         ]);
+        Notifications.dismissNotificationAsync(response.notification.request.identifier).catch(() => {});
       }
     });
 
@@ -2248,10 +2256,10 @@ export default function App() {
         query.length === 0 ||
         exercise.name.toLowerCase().includes(query) ||
         exercise.tags.some((tag) => tag.toLowerCase().includes(query));
-      const matchesFilter = libraryFilters.length === 0 || libraryFilters.every((tag) => exercise.tags.includes(tag));
+      const matchesFilter = !libraryFilter || exercise.tags.includes(libraryFilter);
       return matchesQuery && matchesFilter;
     });
-  }, [libraryFilters, libraryQuery, rehabLibraryExercises]);
+  }, [libraryFilter, libraryQuery, rehabLibraryExercises]);
   const rehabBodyPartFilters = useMemo(
     () => [...new Set(rehabLibraryExercises.flatMap((exercise) => exercise.tags))],
     [rehabLibraryExercises],
@@ -2280,7 +2288,7 @@ export default function App() {
     setWizardExerciseId(null);
     setWizardStep(0);
     setLibraryQuery('');
-    setLibraryFilters([]);
+    setLibraryFilter(null);
   };
   const openRehabCategoryEditor = (exercise: LibraryExercise) => {
     setRehabCategoryEditorExerciseId(exercise.id);
@@ -2473,18 +2481,16 @@ export default function App() {
                 contentContainerStyle={styles.filterRowContent}
               >
                 {rehabBodyPartFilters.map((tag) => {
-                  const active = libraryFilters.includes(tag);
+                  const active = libraryFilter === tag;
                   return (
                     <Pressable
                       key={tag}
-                      style={[styles.chip, active && styles.chipActive]}
+                      style={[styles.chip, styles.gymFilterChip, active && styles.chipActive, active && styles.gymFilterChipActive]}
                       onPress={() =>
-                        setLibraryFilters((prev) =>
-                          prev.includes(tag) ? prev.filter((item) => item !== tag) : [...prev, tag],
-                        )
+                        setLibraryFilter((prev) => (prev === tag ? null : tag))
                       }
                     >
-                      <Text style={[styles.chipText, active && styles.chipTextActive]}>{tag}</Text>
+                      <Text style={[styles.chipText, styles.gymFilterChipText, active && styles.chipTextActive]}>{tag}</Text>
                     </Pressable>
                   );
                 })}
@@ -2960,15 +2966,15 @@ const styles = StyleSheet.create({
     paddingBottom: 16,
   },
   gymBottomSheet: {
-    minHeight: '100%',
-    maxHeight: '100%',
+    minHeight: '92%',
+    maxHeight: '92%',
     borderTopLeftRadius: 0,
     borderTopRightRadius: 0,
     paddingTop: 0,
   },
   libraryBottomSheet: {
-    minHeight: '100%',
-    maxHeight: '100%',
+    minHeight: '92%',
+    maxHeight: '92%',
     borderTopLeftRadius: 0,
     borderTopRightRadius: 0,
     paddingTop: 0,
