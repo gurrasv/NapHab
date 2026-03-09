@@ -2,11 +2,12 @@
   "expo": {
     "name": "TrackWell",
     "slug": "trackwell",
+    "scheme": "trackwell",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
-    "newArchEnabled": true,
+    "newArchEnabled": false,
     "splash": {
       "image": "./assets/splash-icon.png",
       "resizeMode": "contain",
@@ -22,22 +23,26 @@
       },
       "edgeToEdgeEnabled": true,
       "predictiveBackGestureEnabled": false,
-      "package": "com.gurrasv.naphabapp"
+      "package": "com.gurrasv.naphabapp",
+      "permissions": [
+        "android.permission.SCHEDULE_EXACT_ALARM",
+        "android.permission.POST_NOTIFICATIONS"
+      ]
     },
     "web": {
       "favicon": "./assets/favicon.png"
     },
     "plugins": [
-      [
-        "expo-notifications",
-        {
-          "icon": "./assets/icon.png",
-          "color": "#FFE082"
-        }
-      ]
+      "./plugins/withNativeAndroidNotifications",
+      "expo-font",
+      "@react-native-community/datetimepicker"
     ],
     "extra": {
-      "eas": {}
-    }
+      "appVariant": "preview",
+      "eas": {
+        "projectId": "20130e2c-33c9-48f9-9c4e-f19897eae875"
+      }
+    },
+    "owner": "cardistrygurra"
   }
 }

@@ -1,0 +1,4 @@
+# Exclude local Expo state from EAS Build upload
+.expo/
+# So EAS runs prebuild and our plugin can patch expo-notifications
+android/

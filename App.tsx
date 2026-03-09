@@ -1,15 +1,25 @@
 import 'react-native-gesture-handler';
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
+import * as Linking from 'expo-linking';
 import { StatusBar } from 'expo-status-bar';
+import { BlurView } from 'expo-blur';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { MaterialCommunityIcons, MaterialIcons } from '@expo/vector-icons';
-import { DarkTheme as NavigationDarkTheme, NavigationContainer } from '@react-navigation/native';
+import { DarkTheme as NavigationDarkTheme, NavigationContainer, useFocusEffect } from '@react-navigation/native';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
-/* Custom slider replaces @react-native-community/slider for smoother Android performance */
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { GestureHandlerRootView, ScrollView, Swipeable } from 'react-native-gesture-handler';
-import * as Notifications from 'expo-notifications';
+import { Gesture, GestureDetector, GestureHandlerRootView, ScrollView, Swipeable } from 'react-native-gesture-handler';
 import * as Device from 'expo-device';
+import {
+  consumeAndroidPendingCompletions,
+  dismissAndroidWorkoutNotification,
+  ensureAndroidExactAlarmPermission,
+  requestAndroidNotificationPermission,
+  scheduleAndroidNotifications,
+  showAndroidWorkoutNotification,
+  type AndroidNotificationSchedule,
+} from './notifications/androidNativeNotifications';
+import { buildUpcomingScheduleOccurrences } from './notifications/schedulerEngine';
 import {
   Alert,
   Animated,
@@ -17,27 +27,20 @@ import {
   BackHandler,
   Dimensions,
   Easing,
+  FlatList,
   Modal,
   PanResponder,
   Platform,
   Pressable,
+  ScrollView as RNScrollView,
   StyleSheet,
   Switch,
   Text,
   TextInput,
   View,
 } from 'react-native';
-import { Button, Checkbox, Dialog, FAB, MD3DarkTheme, Portal, Provider as PaperProvider } from 'react-native-paper';
+import { Button, Checkbox, Dialog, MD3DarkTheme, Portal, Provider as PaperProvider } from 'react-native-paper';
 import Svg, { Circle, Line, Path, Rect } from 'react-native-svg';
-
-/* ── Notification handler (must be called at module level) ── */
-Notifications.setNotificationHandler({
-  handleNotification: async () => ({
-    shouldShowAlert: true,
-    shouldPlaySound: true,
-    shouldSetBadge: false,
-  }),
-});
 
 type Exercise = {
   id: string;
@@ -58,10 +61,11 @@ type PainSeries = { id: string; name: string; value: number; draftNote: string; 
 type SessionSet = { id: string; reps: number; weightKg: number };
 type SessionExercise = {
   id: string;
+  libraryExerciseId?: string;
   name: string;
   sets: SessionSet[];
 };
-type WorkoutPlanExercise = { id: string; name: string; sets: number; reps: number };
+type WorkoutPlanExercise = { id: string; libraryExerciseId?: string; name: string; sets: number; reps: number; repsPerSet?: number[] };
 type WorkoutPlan = { id: string; name: string; exercises: WorkoutPlanExercise[]; createdAtIso: string };
 type CompletedWorkout = {
   id: string;
@@ -72,12 +76,20 @@ type CompletedWorkout = {
   sourcePlanId?: string;
   sourcePlanName?: string;
 };
+type ExerciseWeightPb = {
+  exerciseId: string;
+  weightKey: number;
+  bestReps: number;
+  date: string;
+};
+type PbSortMode = 'reps_desc' | 'reps_asc' | 'weight_desc' | 'weight_asc' | 'date_desc';
 type PersistedState = {
   exercises: Exercise[];
   logs: ExerciseLog[];
   painSeries: PainSeries[];
   workoutPlans?: WorkoutPlan[];
   completedWorkouts?: CompletedWorkout[];
+  exerciseWeightPbs?: ExerciseWeightPb[];
   rehabLibraryExercises?: LibraryExercise[];
   gymLibraryExercises?: LibraryExercise[];
 };
@@ -87,6 +99,48 @@ type LibraryExercise = { id: string; name: string; tags: string[] };
 type WizardMode = 'create' | 'edit';
 
 const Tab = createBottomTabNavigator();
+
+type TabTransitionDirection = 'left' | 'right' | null;
+const TabTransitionContext = createContext<{
+  direction: TabTransitionDirection;
+  clearDirection: () => void;
+}>({ direction: null, clearDirection: () => {} });
+
+const TAB_SWIPE_DURATION_MS = 180;
+const TAB_SWIPE_DISTANCE_RATIO = 0.05;
+const APP_BG_COLOR = '#0F1419';
+const CARD_TRANSITION_CORNER_RADIUS = 16;
+const MIN_CARD_TRANSITION_SCALE = 0.2;
+
+function AnimatedTabScreen({ children }: { children: React.ReactNode }) {
+  const { direction, clearDirection } = useContext(TabTransitionContext);
+  const translateX = useRef(new Animated.Value(0)).current;
+
+  useFocusEffect(
+    useCallback(() => {
+      if (direction === null) {
+        translateX.setValue(0);
+        return;
+      }
+      const { width } = Dimensions.get('window');
+      const fromX = direction === 'right' ? width * TAB_SWIPE_DISTANCE_RATIO : -width * TAB_SWIPE_DISTANCE_RATIO;
+      translateX.setValue(fromX);
+      Animated.timing(translateX, {
+        toValue: 0,
+        duration: TAB_SWIPE_DURATION_MS,
+        useNativeDriver: true,
+        easing: Easing.out(Easing.cubic),
+      }).start(() => clearDirection());
+    }, [direction, clearDirection, translateX])
+  );
+
+  return (
+    <Animated.View style={{ flex: 1, backgroundColor: APP_BG_COLOR, transform: [{ translateX }] }}>
+      {children}
+    </Animated.View>
+  );
+}
+
 const DAY_WIDTH = 52;
 const STORAGE_KEY = 'naphab_state_v1';
 const SERIES_COLORS = [
@@ -95,15 +149,16 @@ const SERIES_COLORS = [
 ];
 const DAY_COLORS = ['#5E81AC', '#A3BE8C', '#EBCB8B', '#B48EAD', '#88C0D0', '#D08770', '#81A1C1'];
 const PLACEHOLDER_COLOR = '#8FA1B3';
+const WEIGHT_KEY_FACTOR = 2; // 0.5 kg increments
 const ENTRY_SPACING = 70;
 const CHART_SIDE_PADDING = 28;
 const DIARY_VIEW_ORDER: DiaryViewMode[] = ['tim', 'dag', 'manad'];
+const PB_SORT_ORDER: PbSortMode[] = ['reps_desc', 'reps_asc', 'weight_desc', 'weight_asc', 'date_desc'];
 const DIARY_VIEW_CONFIG: Record<DiaryViewMode, { label: string; spanMs: number }> = {
   tim: { label: 'Tim vy', spanMs: 24 * 60 * 60 * 1000 },
   dag: { label: 'Dags vy', spanMs: 7 * 24 * 60 * 60 * 1000 },
   manad: { label: 'Månads vy', spanMs: 28 * 24 * 60 * 60 * 1000 },
 };
-const SEED_START_DATE = new Date('2025-11-01T00:00:00.000Z');
 const WEEKDAY_CHIPS: { key: WeekdayKey; label: string }[] = [
   { key: 'mon', label: 'Mån' },
   { key: 'tue', label: 'Tis' },
@@ -131,11 +186,29 @@ const WEEKDAY_KEY_BY_LABEL: Record<string, WeekdayKey> = {
   lör: 'sat',
   sön: 'sun',
 };
+const WEEKDAY_KEY_BY_JS_DAY: Record<number, WeekdayKey> = {
+  0: 'sun',
+  1: 'mon',
+  2: 'tue',
+  3: 'wed',
+  4: 'thu',
+  5: 'fri',
+  6: 'sat',
+};
+const toWeightKey = (weightKg: number): number => Math.round(weightKg * WEIGHT_KEY_FACTOR);
+const weightKeyToKg = (weightKey: number): number => weightKey / WEIGHT_KEY_FACTOR;
+const formatWeightKg = (weightKg: number): string => (Number.isInteger(weightKg) ? `${weightKg}` : weightKg.toFixed(1));
+const dominatesPbPoint = (
+  a: { weightKey: number; bestReps: number },
+  b: { weightKey: number; bestReps: number },
+): boolean =>
+  a.weightKey >= b.weightKey
+  && a.bestReps >= b.bestReps
+  && (a.weightKey > b.weightKey || a.bestReps > b.bestReps);
+const pruneDominatedPbRows = <T extends { weightKey: number; bestReps: number }>(rows: T[]): T[] =>
+  rows.filter((row, idx) => !rows.some((other, otherIdx) => otherIdx !== idx && dominatesPbPoint(other, row)));
 
-/* ── Notification constants & helpers ── */
-const NOTIFICATION_CATEGORY_ID = 'exercise_reminder';
-const SNOOZE_MINUTES = 10;
-const NOTIFICATION_CHANNEL_ID = 'exercise-reminders';
+/* ── Notification helpers ── */
 const WEEKDAY_KEY_TO_JS_DAY: Record<WeekdayKey, number> = {
   sun: 0, mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6,
 };
@@ -151,103 +224,51 @@ function parseDaysLabelToJsDays(daysLabel: string): number[] {
     .map((key) => WEEKDAY_KEY_TO_JS_DAY[key]);
 }
 
-/**
- * Returns true if the exercise was logged within 1 hour BEFORE the scheduled time.
- * This prevents sending a notification when the user already marked the exercise as done.
- */
-function wasExerciseLoggedNearTime(
-  exerciseId: string,
-  scheduledTime: Date,
-  logs: ExerciseLog[],
-): boolean {
-  const oneHourBeforeMs = scheduledTime.getTime() - 60 * 60 * 1000;
-  const scheduledMs = scheduledTime.getTime();
-  return logs.some((log) => {
-    if (log.exerciseId !== exerciseId) return false;
-    const logMs = new Date(log.atIso).getTime();
-    return logMs >= oneHourBeforeMs && logMs <= scheduledMs;
-  });
+function getTodayWeekdayKey(): WeekdayKey {
+  return WEEKDAY_KEY_BY_JS_DAY[new Date().getDay()] ?? 'mon';
 }
 
-/**
- * Cancel all previously scheduled notifications and re-schedule for the next 7 days
- * based on current exercises and logs.
- */
+function mergeLogs(base: ExerciseLog[], incoming: ExerciseLog[]): ExerciseLog[] {
+  if (incoming.length === 0) return base;
+  const seen = new Set(base.map((log) => `${log.exerciseId}|${log.atIso}`));
+  const out = [...base];
+  incoming.forEach((log) => {
+    const key = `${log.exerciseId}|${log.atIso}`;
+    if (!log.exerciseId || !log.atIso || seen.has(key)) return;
+    seen.add(key);
+    out.push(log);
+  });
+  return out;
+}
+
 async function scheduleExerciseNotifications(
   exercises: Exercise[],
-  logs: ExerciseLog[],
 ): Promise<void> {
-  // Cancel everything so we start fresh
-  await Notifications.cancelAllScheduledNotificationsAsync();
-
-  if (!Device.isDevice) return; // Notifications require a physical device
-
-  // Ensure Android notification channel exists
-  if (Platform.OS === 'android') {
-    await Notifications.setNotificationChannelAsync(NOTIFICATION_CHANNEL_ID, {
-      name: 'Övningspåminnelser',
-      importance: Notifications.AndroidImportance.HIGH,
-      vibrationPattern: [0, 250, 250, 250],
-      sound: 'default',
-    });
-  }
+  if (!Device.isDevice) return;
 
   const now = new Date();
+  const candidates = buildUpcomingScheduleOccurrences(exercises, {
+    now,
+    windowDays: 30,
+  });
 
-  for (const exercise of exercises) {
-    if (!exercise.remindersOn || exercise.times.length === 0) continue;
+  if (Platform.OS !== 'android') return;
 
-    const jsDays = parseDaysLabelToJsDays(exercise.daysLabel);
-    if (jsDays.length === 0) continue;
+  const notificationPermissionGranted = await requestAndroidNotificationPermission();
+  if (!notificationPermissionGranted) return;
+  // Even without exact alarm permission we still schedule with inexact fallback in native layer.
+  await ensureAndroidExactAlarmPermission();
 
-    for (let dayOffset = 0; dayOffset < 7; dayOffset++) {
-      const date = new Date(now.getFullYear(), now.getMonth(), now.getDate() + dayOffset);
-      if (!jsDays.includes(date.getDay())) continue;
-
-      for (const timeStr of exercise.times) {
-        const parts = timeStr.split(':');
-        const hours = Number(parts[0]);
-        const minutes = Number(parts[1]);
-        if (!Number.isFinite(hours) || !Number.isFinite(minutes)) continue;
-
-        const scheduledTime = new Date(
-          date.getFullYear(), date.getMonth(), date.getDate(),
-          hours, minutes, 0, 0,
-        );
-
-        // Skip times in the past
-        if (scheduledTime.getTime() <= now.getTime()) continue;
-
-        // Skip if user already logged this exercise within 1 h before the slot
-        if (wasExerciseLoggedNearTime(exercise.id, scheduledTime, logs)) continue;
-
-        try {
-          await Notifications.scheduleNotificationAsync({
-            content: {
-              title: 'Dags för övning!',
-              body: `${exercise.title} – ${exercise.sets} set × ${exercise.reps} reps`,
-              categoryIdentifier: NOTIFICATION_CATEGORY_ID,
-              data: {
-                exerciseId: exercise.id,
-                exerciseTitle: exercise.title,
-                exerciseSets: exercise.sets,
-                exerciseReps: exercise.reps,
-                scheduledTimeIso: scheduledTime.toISOString(),
-              },
-              sound: true,
-              ...(Platform.OS === 'android' ? { channelId: NOTIFICATION_CHANNEL_ID } : {}),
-            },
-            trigger: {
-              type: Notifications.SchedulableTriggerInputTypes.DATE,
-              date: scheduledTime,
-            },
-          });
-        } catch {
-          // Skip individual scheduling failures silently
-        }
-      }
-    }
-  }
+  const payloads: AndroidNotificationSchedule[] = candidates.map(({ exerciseId, title, sets, reps, scheduledTime, scheduleId }) => ({
+    exerciseId,
+    title,
+    sets,
+    reps,
+    scheduledAtIso: scheduledTime.toISOString(),
+    scheduleId,
+  }));
+  // Native side performs cancel + replace atomically, including clearing all when payloads is empty.
+  await scheduleAndroidNotifications(payloads);
 }
 
 const LIBRARY_EXERCISES: LibraryExercise[] = [
@@ -264,23 +285,87 @@ const LIBRARY_EXERCISES: LibraryExercise[] = [
   { id: 'boj-strack-brostrygg', name: 'Sittande böj/sträck bröstrygg', tags: ['Bröstrygg'] },
 ];
 const GYM_LIBRARY_EXERCISES: LibraryExercise[] = [
-  { id: 'bench-press', name: 'Bänkpress', tags: ['Bröst', 'Triceps'] },
-  { id: 'squat', name: 'Knäböj', tags: ['Ben'] },
-  { id: 'deadlift', name: 'Marklyft', tags: ['Rygg', 'Ben'] },
-  { id: 'overhead-press', name: 'Militärpress', tags: ['Axlar', 'Triceps'] },
-  { id: 'barbell-row', name: 'Skivstångsrodd', tags: ['Rygg', 'Biceps'] },
-  { id: 'lat-pulldown', name: 'Latsdrag', tags: ['Rygg', 'Biceps'] },
-  { id: 'leg-press', name: 'Benpress', tags: ['Ben'] },
-  { id: 'romanian-deadlift', name: 'Raka marklyft', tags: ['Baksida lår', 'Rygg'] },
-  { id: 'incline-dumbbell-press', name: 'Lutande hantelpress', tags: ['Bröst', 'Axlar'] },
-  { id: 'bicep-curl', name: 'Bicepscurl', tags: ['Biceps'] },
-  { id: 'tricep-pushdown', name: 'Triceps pushdown', tags: ['Triceps'] },
-  { id: 'hip-thrust', name: 'Hip thrust', tags: ['Säte', 'Ben'] },
+  { id: 'bench-press', name: 'Bänkpress', tags: ['Bröst', 'Triceps', 'Fria vikter'] },
+  { id: 'incline-dumbbell-press', name: 'Lutande hantelpress', tags: ['Bröst', 'Axlar', 'Fria vikter'] },
+  { id: 'dumbbell-press', name: 'Hantelpress', tags: ['Bröst', 'Triceps', 'Fria vikter'] },
+  { id: 'dumbbell-flyes', name: 'Hantelflyes', tags: ['Bröst', 'Fria vikter'] },
+  { id: 'overhead-press', name: 'Militärpress', tags: ['Axlar', 'Triceps', 'Fria vikter'] },
+  { id: 'dumbbell-shoulder-press', name: 'Hantelpress axlar', tags: ['Axlar', 'Triceps', 'Fria vikter'] },
+  { id: 'lateral-raise', name: 'Sidolyft', tags: ['Axlar', 'Fria vikter'] },
+  { id: 'front-raise', name: 'Framlyft', tags: ['Axlar', 'Fria vikter'] },
+  { id: 'face-pull', name: 'Face pull', tags: ['Axlar', 'Rygg', 'Fria vikter'] },
+  { id: 'barbell-row', name: 'Skivstångsrodd', tags: ['Rygg', 'Biceps', 'Fria vikter'] },
+  { id: 'deadlift', name: 'Marklyft', tags: ['Rygg', 'Ben', 'Fria vikter'] },
+  { id: 'romanian-deadlift', name: 'Raka marklyft', tags: ['Baksida lår', 'Rygg', 'Fria vikter'] },
+  { id: 'dumbbell-row', name: 'Hantelrodd', tags: ['Rygg', 'Biceps', 'Fria vikter'] },
+  { id: 't-bar-row', name: 'T-bar rodd', tags: ['Rygg', 'Biceps', 'Fria vikter'] },
+  { id: 'pull-up', name: 'Chins / Pull-up', tags: ['Rygg', 'Biceps', 'Fria vikter', 'Kroppsvikt'] },
+  { id: 'squat', name: 'Knäböj', tags: ['Ben', 'Fria vikter'] },
+  { id: 'goblet-squat', name: 'Goblet squat', tags: ['Ben', 'Fria vikter'] },
+  { id: 'bulgarian-split-squat', name: 'Bulgariansk split squat', tags: ['Ben', 'Fria vikter'] },
+  { id: 'lunges', name: 'Utfall', tags: ['Ben', 'Fria vikter', 'Kroppsvikt'] },
+  { id: 'hip-thrust', name: 'Hip thrust', tags: ['Säte', 'Ben', 'Fria vikter'] },
+  { id: 'calf-raise', name: 'Vadlyft', tags: ['Ben', 'Vader', 'Fria vikter'] },
+  { id: 'bicep-curl', name: 'Bicepscurl', tags: ['Biceps', 'Fria vikter'] },
+  { id: 'hammer-curl', name: 'Hammer curl', tags: ['Biceps', 'Underarm', 'Fria vikter'] },
+  { id: 'barbell-curl', name: 'Skivstångscurl', tags: ['Biceps', 'Fria vikter'] },
+  { id: 'tricep-kickback', name: 'Triceps kickback', tags: ['Triceps', 'Fria vikter'] },
+  { id: 'skull-crusher', name: 'Fransk press', tags: ['Triceps', 'Fria vikter'] },
+  { id: 'close-grip-bench', name: 'Smal bänkpress', tags: ['Triceps', 'Bröst', 'Fria vikter'] },
+  { id: 'lat-pulldown', name: 'Latsdrag', tags: ['Rygg', 'Biceps', 'Maskin'] },
+  { id: 'chest-press-machine', name: 'Bröstpress (maskin)', tags: ['Bröst', 'Triceps', 'Maskin'] },
+  { id: 'pec-deck', name: 'Pec deck / Butterfly', tags: ['Bröst', 'Maskin'] },
+  { id: 'cable-crossover', name: 'Cable crossover', tags: ['Bröst', 'Maskin', 'Kabel'] },
+  { id: 'cable-fly', name: 'Kabel flyes', tags: ['Bröst', 'Maskin', 'Kabel'] },
+  { id: 'smith-machine-press', name: 'Smith maskin press', tags: ['Axlar', 'Bröst', 'Maskin'] },
+  { id: 'cable-lateral-raise', name: 'Kabel sidolyft', tags: ['Axlar', 'Maskin', 'Kabel'] },
+  { id: 'cable-row', name: 'Kabelrodd', tags: ['Rygg', 'Biceps', 'Maskin', 'Kabel'] },
+  { id: 'seated-cable-row', name: 'Sittande kabelrodd', tags: ['Rygg', 'Biceps', 'Maskin', 'Kabel'] },
+  { id: 'straight-arm-pulldown', name: 'Raka armar latsdrag', tags: ['Rygg', 'Maskin', 'Kabel'] },
+  { id: 'leg-press', name: 'Benpress', tags: ['Ben', 'Maskin'] },
+  { id: 'leg-extension', name: 'Bensträckning', tags: ['Ben', 'Lår', 'Maskin'] },
+  { id: 'leg-curl', name: 'Benböj', tags: ['Baksida lår', 'Ben', 'Maskin'] },
+  { id: 'leg-curl-standing', name: 'Stående benböj', tags: ['Baksida lår', 'Ben', 'Maskin'] },
+  { id: 'calf-raise-machine', name: 'Vadlyft (maskin)', tags: ['Ben', 'Vader', 'Maskin'] },
+  { id: 'hack-squat', name: 'Hack squat', tags: ['Ben', 'Maskin'] },
+  { id: 'smith-squat', name: 'Smith maskin knäböj', tags: ['Ben', 'Maskin'] },
+  { id: 'tricep-pushdown', name: 'Triceps pushdown', tags: ['Triceps', 'Maskin', 'Kabel'] },
+  { id: 'cable-curl', name: 'Kabelcurl', tags: ['Biceps', 'Maskin', 'Kabel'] },
+  { id: 'preacher-curl', name: 'Preacher curl', tags: ['Biceps', 'Maskin'] },
+  { id: 'tricep-dip-machine', name: 'Triceps dip (maskin)', tags: ['Triceps', 'Bröst', 'Maskin'] },
+  { id: 'push-up', name: 'Armhävningar', tags: ['Bröst', 'Triceps', 'Kroppsvikt'] },
+  { id: 'dips', name: 'Dips', tags: ['Bröst', 'Triceps', 'Kroppsvikt'] },
+  { id: 'plank', name: 'Planka', tags: ['Mage', 'Kroppsvikt'] },
+  { id: 'squat-bodyweight', name: 'Knäböj kroppsvikt', tags: ['Ben', 'Kroppsvikt'] },
+  { id: 'mountain-climbers', name: 'Mountain climbers', tags: ['Mage', 'Ben', 'Kroppsvikt'] },
+  { id: 'glute-bridge', name: 'Skattskyffel', tags: ['Säte', 'Ben', 'Kroppsvikt'] },
 ];
+const GYM_EQUIPMENT_TAGS: string[] = ['Fria vikter', 'Maskin', 'Kroppsvikt', 'Kabel'];
+const GYM_EQUIPMENT_SET = new Set(GYM_EQUIPMENT_TAGS);
+
+/** Merges persisted gym library with default list: default exercises always included (new in app updates), user tag edits from persisted kept, custom exercises (Egen / gym-custom-*) appended. */
+function mergeGymLibrary(persisted: LibraryExercise[]): LibraryExercise[] {
+  const persistedById = new Map(persisted.map((e) => [e.id, e]));
+  const defaultIds = new Set(GYM_LIBRARY_EXERCISES.map((e) => e.id));
+  const result: LibraryExercise[] = [];
+  for (const def of GYM_LIBRARY_EXERCISES) {
+    result.push(persistedById.get(def.id) ?? def);
+  }
+  for (const p of persisted) {
+    if (defaultIds.has(p.id)) continue;
+    if (p.id.startsWith('gym-custom-') || p.tags.includes('Egen')) {
+      result.push(p);
+    }
+  }
+  return result;
+}
 
 const swedishWeekday = (date: Date) =>
   new Intl.DateTimeFormat('sv-SE', { weekday: 'short' }).format(date).replace('.', '');
 const formatDateKey = (date: Date) => date.toISOString().slice(0, 10);
+/** YYYY-MM-DD in local timezone (for grouping logs by calendar day, not UTC). */
+const formatDateKeyLocal = (date: Date) =>
+  `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
 const shortDate = (date: Date) =>
   `${String(date.getDate()).padStart(2, '0')}/${String(date.getMonth() + 1).padStart(2, '0')}`;
 const shortTime = (date: Date) =>
@@ -342,94 +427,164 @@ const createCurvePath = (points: { x: number; y: number }[]) => {
   return d;
 };
 
-const buildSeedPainEntries = (tag: string, baseValue: number): PainEntry[] => {
-  const entries: PainEntry[] = [];
-  const now = new Date();
-  const start = new Date(SEED_START_DATE);
-  const totalDays = Math.max(0, Math.floor((now.getTime() - start.getTime()) / (24 * 60 * 60 * 1000)));
-  for (let i = totalDays; i >= 0; i -= 1) {
-    const morning = new Date(now);
-    morning.setDate(now.getDate() - i);
-    morning.setHours(8, 30, 0, 0);
-    const dayKey = formatDateKey(morning);
-    const morningValue = Math.max(1, Math.min(10, baseValue + ((i % 5) - 2)));
-    entries.push({
-      id: `${tag}-m-${dayKey}`,
-      atIso: morning.toISOString(),
-      value: morningValue,
-      note: i % 3 === 0 ? 'Kändes bättre efter promenad.' : '',
-    });
-
-    if (i % 2 === 0) {
-      const evening = new Date(now);
-      evening.setDate(now.getDate() - i);
-      evening.setHours(19, 15, 0, 0);
-      const eveningValue = Math.max(1, Math.min(10, baseValue + 1 - (i % 3)));
-      entries.push({
-        id: `${tag}-e-${dayKey}`,
-        atIso: evening.toISOString(),
-        value: eveningValue,
-        note: i % 8 === 0 ? 'Mer stel på kvällen.' : '',
-      });
-    }
-  }
-  return entries;
-};
-
-const mergeEntriesWithSeed = (currentEntries: PainEntry[], tag: string, baseValue: number): PainEntry[] => {
-  const mergedById = new Map<string, PainEntry>();
-  const byTimestamp = [...currentEntries].sort(
-    (a, b) => new Date(a.atIso).getTime() - new Date(b.atIso).getTime(),
+const stripSeedEntries = (entries: PainEntry[], tag: string): PainEntry[] =>
+  entries.filter(
+    (entry) => !entry.id.startsWith(`${tag}-m-`) && !entry.id.startsWith(`${tag}-e-`),
   );
-  byTimestamp.forEach((entry) => mergedById.set(entry.id, entry));
-  buildSeedPainEntries(tag, baseValue).forEach((entry) => {
-    if (!mergedById.has(entry.id)) {
-      mergedById.set(entry.id, entry);
-    }
-  });
-  return [...mergedById.values()].sort(
-    (a, b) => new Date(a.atIso).getTime() - new Date(b.atIso).getTime(),
-  );
-};
 
 function HomeScreen({
   exercises,
   setExercises,
   onQuickLog,
-  onAddExercise,
   onEditExercise,
   onDeleteExercise,
 }: {
   exercises: Exercise[];
   setExercises: React.Dispatch<React.SetStateAction<Exercise[]>>;
   onQuickLog: (exerciseId: string) => void;
-  onAddExercise: () => void;
   onEditExercise: (exercise: Exercise) => void;
   onDeleteExercise: (exercise: Exercise) => void;
 }) {
   const insets = useSafeAreaInsets();
+  const swipeableRefs = useRef(new Map<string, Swipeable | null>());
+  const openSwipeIdRef = useRef<string | null>(null);
 
   const updateExercise = (id: string, patch: Partial<Exercise>) =>
     setExercises((prev) => prev.map((exercise) => (exercise.id === id ? { ...exercise, ...patch } : exercise)));
 
+  const closeAllSwipes = useCallback((exceptId?: string) => {
+    swipeableRefs.current.forEach((instance, id) => {
+      if (id !== exceptId) instance?.close();
+    });
+    if (!exceptId || openSwipeIdRef.current !== exceptId) {
+      openSwipeIdRef.current = null;
+    }
+  }, []);
+
+  const onCardPress = useCallback((exerciseId: string) => {
+    if (openSwipeIdRef.current && openSwipeIdRef.current !== exerciseId) {
+      closeAllSwipes(exerciseId);
+    }
+  }, [closeAllSwipes]);
+
+  const onEditFromSwipe = useCallback((exercise: Exercise) => {
+    closeAllSwipes();
+    onEditExercise(exercise);
+  }, [closeAllSwipes, onEditExercise]);
+
+  const onDeleteFromSwipe = useCallback((exercise: Exercise) => {
+    closeAllSwipes();
+    onDeleteExercise(exercise);
+  }, [closeAllSwipes, onDeleteExercise]);
+
+  useFocusEffect(
+    useCallback(() => () => closeAllSwipes(), [closeAllSwipes]),
+  );
+
+  const runMinimalTriggerTest = async () => {
+    try {
+      if (!(await requestAndroidNotificationPermission())) {
+        Alert.alert('Test misslyckades', 'Notisbehörighet nekad.');
+        return;
+      }
+      if (!(await ensureAndroidExactAlarmPermission())) return;
+      const triggerAt = new Date(Date.now() + 60 * 1000);
+      const count = await scheduleAndroidNotifications([
+        {
+          exerciseId: 'manual-test',
+          title: 'Manuell testövning',
+          sets: 1,
+          reps: 1,
+          scheduledAtIso: triggerAt.toISOString(),
+          scheduleId: `manual-test-${triggerAt.getTime()}`,
+        },
+      ]);
+      Alert.alert(
+        'Android native test schemalagd',
+        `Notis om ca 60 sek.\nSchemalagda poster: ${count}`,
+      );
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      Alert.alert('Test misslyckades', `Android native test felade: ${msg}`);
+    }
+  };
+
+  const runInstantNotificationTest = async () => {
+    try {
+      if (!(await requestAndroidNotificationPermission())) {
+        Alert.alert('Test misslyckades', 'Notisbehörighet nekad.');
+        return;
+      }
+      if (!(await ensureAndroidExactAlarmPermission())) return;
+      const triggerAt = new Date(Date.now() + 5 * 1000);
+      const count = await scheduleAndroidNotifications([
+        {
+          exerciseId: 'manual-test-now',
+          title: 'Manuell testövning',
+          sets: 1,
+          reps: 1,
+          scheduledAtIso: triggerAt.toISOString(),
+          scheduleId: `manual-now-${triggerAt.getTime()}`,
+        },
+      ]);
+      Alert.alert(
+        'Android native test (snabb)',
+        `Notis om ca 5 sek.\nSchemalagda poster: ${count}`,
+      );
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      Alert.alert('Test misslyckades', `Android native test felade: ${msg}`);
+    }
+  };
+
   return (
     <View style={[styles.screen, { paddingTop: insets.top }]}>  
       <Text style={styles.screenTitle}>TrackWell</Text>
+      {__DEV__ && (
+        <>
+          <Pressable onPress={runInstantNotificationTest} style={styles.minimalTriggerTestButton}>
+            <Text style={styles.minimalTriggerTestText}>Skicka testnotis nu</Text>
+          </Pressable>
+          <Pressable onPress={runMinimalTriggerTest} style={styles.minimalTriggerTestButton}>
+            <Text style={styles.minimalTriggerTestText}>Test 60s trigger</Text>
+          </Pressable>
+        </>
+      )}
       {exercises.length === 0 ? (
         <View style={styles.emptyState}>
           <Text style={styles.emptyTitle}>Inga övningar ännu</Text>
           <Text style={styles.emptySubtitle}>Tryck på ＋ för att lägga till din första övning</Text>
         </View>
       ) : (
-        <ScrollView contentContainerStyle={styles.listContent}>
+        <ScrollView contentContainerStyle={styles.listContent} onTouchEnd={() => closeAllSwipes()}>
           {exercises.map((exercise) => (
             <Swipeable
               key={exercise.id}
+              ref={(instance) => {
+                if (instance) {
+                  swipeableRefs.current.set(exercise.id, instance);
+                  return;
+                }
+                swipeableRefs.current.delete(exercise.id);
+              }}
               overshootLeft={false}
               overshootRight={false}
+              onSwipeableWillOpen={() => {
+                openSwipeIdRef.current = exercise.id;
+                closeAllSwipes(exercise.id);
+              }}
+              onSwipeableOpen={() => {
+                openSwipeIdRef.current = exercise.id;
+                closeAllSwipes(exercise.id);
+              }}
+              onSwipeableClose={() => {
+                if (openSwipeIdRef.current === exercise.id) {
+                  openSwipeIdRef.current = null;
+                }
+              }}
               renderLeftActions={() => (
                 <View style={[styles.swipeActions, styles.swipeActionsLeft]}>
-                  <Pressable style={[styles.swipeButton, styles.editButton]} onPress={() => onEditExercise(exercise)}>
+                  <Pressable style={[styles.swipeButton, styles.editButton]} onPress={() => onEditFromSwipe(exercise)}>
                     <MaterialIcons name="edit" size={22} color="#fff" />
                     <Text style={styles.swipeButtonText}>Redigera</Text>
                   </Pressable>
@@ -437,7 +592,7 @@ function HomeScreen({
               )}
               renderRightActions={() => (
                 <View style={[styles.swipeActions, styles.swipeActionsRight]}>
-                  <Pressable style={[styles.swipeButton, styles.deleteButton]} onPress={() => onDeleteExercise(exercise)}>
+                  <Pressable style={[styles.swipeButton, styles.deleteButton]} onPress={() => onDeleteFromSwipe(exercise)}>
                     <MaterialIcons name="delete" size={22} color="#fff" />
                     <Text style={styles.swipeButtonText}>Ta bort</Text>
                   </Pressable>
@@ -445,6 +600,7 @@ function HomeScreen({
               )}
             >
               <Pressable
+                onPress={() => onCardPress(exercise.id)}
                 onLongPress={() => Alert.alert(exercise.title, exercise.description)}
                 style={[
                   styles.exerciseCard,
@@ -490,12 +646,6 @@ function HomeScreen({
         </ScrollView>
       )}
 
-      <FAB
-        icon="plus"
-        color="#000"
-        style={[styles.fab, { backgroundColor: '#A5D6A7' }]}
-        onPress={onAddExercise}
-      />
     </View>
   );
 }
@@ -505,19 +655,29 @@ function TrainingScreen({
   setWorkoutPlans,
   completedWorkouts,
   setCompletedWorkouts,
+  exerciseWeightPbs,
+  setExerciseWeightPbs,
   gymLibraryExercises,
   setGymLibraryExercises,
+  onFabActionChange,
+  onActiveSessionChange,
 }: {
   workoutPlans: WorkoutPlan[];
   setWorkoutPlans: React.Dispatch<React.SetStateAction<WorkoutPlan[]>>;
   completedWorkouts: CompletedWorkout[];
   setCompletedWorkouts: React.Dispatch<React.SetStateAction<CompletedWorkout[]>>;
+  exerciseWeightPbs: ExerciseWeightPb[];
+  setExerciseWeightPbs: React.Dispatch<React.SetStateAction<ExerciseWeightPb[]>>;
   gymLibraryExercises: LibraryExercise[];
   setGymLibraryExercises: React.Dispatch<React.SetStateAction<LibraryExercise[]>>;
+  onFabActionChange: (action: (() => void) | null) => void;
+  onActiveSessionChange: (active: boolean) => void;
 }) {
+  type TrainingView = 'home' | 'session' | 'builder' | 'saved' | 'planDetail' | 'historyDetail' | 'pbOverview' | 'preloaded';
+  type CardRect = { x: number; y: number; width: number; height: number };
   const insets = useSafeAreaInsets();
   const gymSheetMaxDrag = Math.round(Dimensions.get('window').height * 0.92);
-  const [view, setView] = useState<'home' | 'session' | 'builder' | 'saved' | 'historyDetail'>('home');
+  const [view, setView] = useState<TrainingView>('home');
   const [libraryMode, setLibraryMode] = useState<'session' | 'builder' | null>(null);
   const [sessionStartedAtIso, setSessionStartedAtIso] = useState<string | null>(null);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
@@ -527,6 +687,9 @@ function TrainingScreen({
   const [builderName, setBuilderName] = useState('');
   const [builderExercises, setBuilderExercises] = useState<WorkoutPlanExercise[]>([]);
   const [editingPlanId, setEditingPlanId] = useState<string | null>(null);
+  const [selectedPlanId, setSelectedPlanId] = useState<string | null>(null);
+  const [builderConfirmVisible, setBuilderConfirmVisible] = useState(false);
+  const [sessionConfirmVisible, setSessionConfirmVisible] = useState(false);
   const [historySelectionMode, setHistorySelectionMode] = useState(false);
   const [selectedHistoryWorkoutIds, setSelectedHistoryWorkoutIds] = useState<string[]>([]);
   const [selectedHistoryWorkout, setSelectedHistoryWorkout] = useState<CompletedWorkout | null>(null);
@@ -537,10 +700,79 @@ function TrainingScreen({
   const [gymLibraryVisible, setGymLibraryVisible] = useState(false);
   const [gymLibraryQuery, setGymLibraryQuery] = useState('');
   const [gymLibraryFilter, setGymLibraryFilter] = useState<string | null>(null);
+  const [gymLibraryEquipmentFilter, setGymLibraryEquipmentFilter] = useState<string | null>(null);
   const [gymSheetExpanded, setGymSheetExpanded] = useState(false);
+  const [pbModalExercise, setPbModalExercise] = useState<SessionExercise | null>(null);
+  const [pbSortMode, setPbSortMode] = useState<PbSortMode>('reps_desc');
+  const [pbSummaryVisible, setPbSummaryVisible] = useState(false);
+  const [pbSummaryRows, setPbSummaryRows] = useState<
+    { exerciseName: string; weightKg: number; oldBestReps: number; newBestReps: number }[]
+  >([]);
+  const [pbSummaryTotal, setPbSummaryTotal] = useState(0);
   const gymSheetTranslateY = useRef(new Animated.Value(150)).current;
   const gymSheetStartY = useRef(150);
   const pulseAnim = useRef(new Animated.Value(1)).current;
+  const transitionAnim = useRef(new Animated.Value(1)).current;
+  const transitionBlurOpacity = useRef(new Animated.Value(0)).current;
+  const transitionBusyRef = useRef(false);
+  const transitionBeforeOpenRef = useRef<(() => void) | null>(null);
+  const cardBounceAnim = useRef(new Animated.Value(1)).current;
+  const cardPressAnim = useRef(new Animated.Value(1)).current;
+  const trainingViewRef = useRef<View | null>(null);
+  const startCardRef = useRef<View | null>(null);
+  const builderCardRef = useRef<View | null>(null);
+  const savedCardRef = useRef<View | null>(null);
+  const preloadedCardRef = useRef<View | null>(null);
+  const pbCardRef = useRef<View | null>(null);
+  const [transitionContainerRect, setTransitionContainerRect] = useState<CardRect | null>(null);
+  const [transitionOriginRect, setTransitionOriginRect] = useState<CardRect | null>(null);
+  const [transitionActive, setTransitionActive] = useState(false);
+  const [transitionMode, setTransitionMode] = useState<'idle' | 'opening' | 'closing'>('idle');
+  const [transitionPreviewView, setTransitionPreviewView] = useState<Exclude<TrainingView, 'home'> | null>(null);
+  const [lastClosedView, setLastClosedView] = useState<Exclude<TrainingView, 'home'> | null>(null);
+  const [pressedCardView, setPressedCardView] = useState<Exclude<TrainingView, 'home'> | null>(null);
+  const lastOriginByViewRef = useRef<Partial<Record<Exclude<TrainingView, 'home'>, CardRect>>>({});
+
+  const SESSION_STORAGE_KEY = 'naphab_active_session_v1';
+
+  // Restore active session on mount
+  useEffect(() => {
+    AsyncStorage.getItem(SESSION_STORAGE_KEY).then((raw) => {
+      if (!raw) return;
+      try {
+        const saved = JSON.parse(raw) as { startedAtIso: string; exercises: SessionExercise[]; sourcePlanId: string | null; sourcePlanName: string | null };
+        if (saved.startedAtIso && Array.isArray(saved.exercises)) {
+          setSessionStartedAtIso(saved.startedAtIso);
+          setSessionExercises(saved.exercises);
+          setSessionSourcePlanId(saved.sourcePlanId);
+          setSessionSourcePlanName(saved.sourcePlanName);
+        }
+      } catch { /* ignore */ }
+    }).catch(() => {});
+  }, []);
+
+  // Persist active session whenever it changes
+  useEffect(() => {
+    if (!sessionStartedAtIso) {
+      AsyncStorage.removeItem(SESSION_STORAGE_KEY).catch(() => {});
+      return;
+    }
+    AsyncStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify({
+      startedAtIso: sessionStartedAtIso,
+      exercises: sessionExercises,
+      sourcePlanId: sessionSourcePlanId,
+      sourcePlanName: sessionSourcePlanName,
+    })).catch(() => {});
+  }, [sessionStartedAtIso, sessionExercises, sessionSourcePlanId, sessionSourcePlanName]);
+
+  useEffect(() => {
+    if (Platform.OS !== 'android') return;
+    if (sessionStartedAtIso) {
+      showAndroidWorkoutNotification(sessionStartedAtIso).catch(() => {});
+    } else {
+      dismissAndroidWorkoutNotification().catch(() => {});
+    }
+  }, [sessionStartedAtIso]);
 
   useEffect(() => {
     if (!sessionStartedAtIso) return;
@@ -568,6 +800,36 @@ function TrainingScreen({
     return () => loop.stop();
   }, [sessionStartedAtIso, view, pulseAnim]);
 
+  // Notify parent when active session status changes (for navbar pulse)
+  useEffect(() => {
+    onActiveSessionChange(sessionStartedAtIso !== null);
+  }, [sessionStartedAtIso, onActiveSessionChange]);
+
+  // Track whether this tab is currently focused
+  const screenFocusedRef = useRef(false);
+
+  // Jump to session or reset to home when tab gains focus
+  useFocusEffect(
+    useCallback(() => {
+      screenFocusedRef.current = true;
+      if (sessionStartedAtIso) {
+        setView('session');
+      } else {
+        setView('home');
+      }
+      return () => {
+        screenFocusedRef.current = false;
+      };
+    }, [sessionStartedAtIso])
+  );
+
+  // Auto-jump to session when AsyncStorage restores a session while the tab is already active
+  useEffect(() => {
+    if (sessionStartedAtIso && screenFocusedRef.current) {
+      setView('session');
+    }
+  }, [sessionStartedAtIso]);
+
   const formatDuration = (totalSec: number) => {
     const h = Math.floor(totalSec / 3600);
     const m = Math.floor((totalSec % 3600) / 60);
@@ -576,20 +838,249 @@ function TrainingScreen({
       ? `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
       : `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
   };
+  const pbSortLabel = useMemo(() => {
+    if (pbSortMode === 'reps_desc') return 'Reps ↓';
+    if (pbSortMode === 'reps_asc') return 'Reps ↑';
+    if (pbSortMode === 'weight_desc') return 'Vikt ↓';
+    if (pbSortMode === 'weight_asc') return 'Vikt ↑';
+    return 'Senast datum ↓';
+  }, [pbSortMode]);
+  const gymLibraryIdByName = useMemo(
+    () => new Map(gymLibraryExercises.map((exercise) => [exercise.name.trim().toLowerCase(), exercise.id])),
+    [gymLibraryExercises],
+  );
+  const resolveSessionExercisePbId = useCallback((exercise: SessionExercise) => {
+    if (exercise.libraryExerciseId) return exercise.libraryExerciseId;
+    const fromLibrary = gymLibraryIdByName.get(exercise.name.trim().toLowerCase());
+    if (fromLibrary) return fromLibrary;
+    return `name:${exercise.name.trim().toLowerCase()}`;
+  }, [gymLibraryIdByName]);
+  const rebuildExerciseWeightPbsFromWorkouts = useCallback((workouts: CompletedWorkout[]): ExerciseWeightPb[] => {
+    const byKey = new Map<string, ExerciseWeightPb>();
+    workouts.forEach((workout) => {
+      workout.exercises.forEach((exercise) => {
+        const exerciseId = resolveSessionExercisePbId(exercise);
+        exercise.sets.forEach((setEntry) => {
+          if (setEntry.weightKg <= 0 || setEntry.reps <= 0) return;
+          const weightKey = toWeightKey(setEntry.weightKg);
+          const key = `${exerciseId}|${weightKey}`;
+          const existing = byKey.get(key);
+          if (!existing || setEntry.reps > existing.bestReps) {
+            byKey.set(key, {
+              exerciseId,
+              weightKey,
+              bestReps: setEntry.reps,
+              date: workout.endedAtIso,
+            });
+            return;
+          }
+          if (setEntry.reps === existing.bestReps && new Date(workout.endedAtIso).getTime() > new Date(existing.date).getTime()) {
+            byKey.set(key, { ...existing, date: workout.endedAtIso });
+          }
+        });
+      });
+    });
+    const grouped = new Map<string, ExerciseWeightPb[]>();
+    [...byKey.values()].forEach((entry) => {
+      const list = grouped.get(entry.exerciseId) ?? [];
+      grouped.set(entry.exerciseId, [...list, entry]);
+    });
+    const pruned: ExerciseWeightPb[] = [];
+    grouped.forEach((rows) => {
+      pruned.push(...pruneDominatedPbRows(rows));
+    });
+    return pruned;
+  }, [resolveSessionExercisePbId]);
+  useEffect(() => {
+    // PB index is derived from history to avoid stale rows.
+    setExerciseWeightPbs(rebuildExerciseWeightPbsFromWorkouts(completedWorkouts));
+  }, [completedWorkouts, rebuildExerciseWeightPbsFromWorkouts, setExerciseWeightPbs]);
+  const sessionSetFeedbackBySetKey = useMemo(() => {
+    const feedbackBySet = new Map<
+    string,
+    {
+      kind: 'new' | 'current';
+      exerciseId: string;
+      exerciseName: string;
+      weightKey: number;
+      weightKg: number;
+      oldBestReps: number;
+      newBestReps: number;
+    }
+    >();
+    const baselineBest = new Map<string, number>();
+    const baselineFrontierByExercise = new Map<string, { weightKey: number; bestReps: number }[]>();
+    exerciseWeightPbs.forEach((entry) => {
+      const key = `${entry.exerciseId}|${entry.weightKey}`;
+      const previous = baselineBest.get(key) ?? 0;
+      if (entry.bestReps > previous) baselineBest.set(key, entry.bestReps);
+      const existing = baselineFrontierByExercise.get(entry.exerciseId) ?? [];
+      baselineFrontierByExercise.set(
+        entry.exerciseId,
+        pruneDominatedPbRows([...existing, { weightKey: entry.weightKey, bestReps: entry.bestReps }]),
+      );
+    });
+    sessionExercises.forEach((exercise) => {
+      const exerciseId = resolveSessionExercisePbId(exercise);
+      const finalBestByWeight = new Map<number, number>();
+      exercise.sets.forEach((setEntry) => {
+        if (setEntry.weightKg <= 0 || setEntry.reps <= 0) return;
+        const weightKey = toWeightKey(setEntry.weightKg);
+        const previous = finalBestByWeight.get(weightKey) ?? 0;
+        if (setEntry.reps > previous) finalBestByWeight.set(weightKey, setEntry.reps);
+      });
+      const candidatePoints = [...finalBestByWeight.entries()]
+        .map(([weightKey, bestReps]) => ({ weightKey, bestReps }))
+        .filter((point) => point.bestReps > (baselineBest.get(`${exerciseId}|${point.weightKey}`) ?? 0));
+      const frontierWithCandidates = pruneDominatedPbRows([
+        ...(baselineFrontierByExercise.get(exerciseId) ?? []),
+        ...candidatePoints,
+      ]);
+      const baselineFrontier = baselineFrontierByExercise.get(exerciseId) ?? [];
+      const emittedPointKeys = new Set<string>();
+      exercise.sets.forEach((setEntry) => {
+        if (setEntry.weightKg <= 0 || setEntry.reps <= 0) return;
+        const weightKey = toWeightKey(setEntry.weightKg);
+        const bestForWeightInSession = finalBestByWeight.get(weightKey) ?? 0;
+        if (setEntry.reps !== bestForWeightInSession) return;
+        const oldBestReps = baselineBest.get(`${exerciseId}|${weightKey}`) ?? 0;
+        const candidatePoint = { weightKey, bestReps: setEntry.reps };
+        if (!frontierWithCandidates.some((point) => point.weightKey === candidatePoint.weightKey && point.bestReps === candidatePoint.bestReps)) return;
+        const pointKey = `${candidatePoint.weightKey}|${candidatePoint.bestReps}`;
+        if (emittedPointKeys.has(pointKey)) return;
+        let kind: 'new' | 'current' | null = null;
+        if (setEntry.reps > oldBestReps) {
+          kind = 'new';
+        } else if (
+          oldBestReps > 0
+          && setEntry.reps === oldBestReps
+          && baselineFrontier.some((point) => point.weightKey === candidatePoint.weightKey && point.bestReps === candidatePoint.bestReps)
+        ) {
+          kind = 'current';
+        }
+        if (!kind) return;
+        emittedPointKeys.add(pointKey);
+        feedbackBySet.set(`${exercise.id}|${setEntry.id}`, {
+          kind,
+          exerciseId,
+          exerciseName: exercise.name,
+          weightKey,
+          weightKg: weightKeyToKg(weightKey),
+          oldBestReps,
+          newBestReps: setEntry.reps,
+        });
+      });
+    });
+    return feedbackBySet;
+  }, [exerciseWeightPbs, resolveSessionExercisePbId, sessionExercises]);
+  const sessionPbEvents = useMemo(() => {
+    const map = new Map<string, { exerciseId: string; exerciseName: string; weightKey: number; weightKg: number; oldBestReps: number; newBestReps: number }>();
+    sessionSetFeedbackBySetKey.forEach((entry) => {
+      if (entry.kind !== 'new') return;
+      const key = `${entry.exerciseId}|${entry.weightKey}`;
+      const existing = map.get(key);
+      if (!existing) {
+        map.set(key, { ...entry });
+        return;
+      }
+      map.set(key, { ...existing, newBestReps: Math.max(existing.newBestReps, entry.newBestReps) });
+    });
+    return [...map.values()];
+  }, [sessionSetFeedbackBySetKey]);
+  const pbOverviewExercises = useMemo(() => {
+    const grouped = new Map<string, ExerciseWeightPb[]>();
+    exerciseWeightPbs.forEach((entry) => {
+      const list = grouped.get(entry.exerciseId) ?? [];
+      grouped.set(entry.exerciseId, [...list, entry]);
+    });
+    return [...grouped.entries()]
+      .map(([exerciseId, rows]) => {
+        const fromLibrary = gymLibraryExercises.find((exercise) => exercise.id === exerciseId);
+        const fallbackName = exerciseId.startsWith('name:') ? exerciseId.slice('name:'.length) : exerciseId;
+        const displayName = fromLibrary?.name || fallbackName;
+        const bestReps = rows.reduce((max, row) => Math.max(max, row.bestReps), 0);
+        const highestWeightKey = rows.reduce((max, row) => Math.max(max, row.weightKey), 0);
+        return { exerciseId, displayName, rowsCount: rows.length, bestReps, highestWeightKey };
+      })
+      .sort((a, b) => a.displayName.localeCompare(b.displayName, 'sv-SE'));
+  }, [exerciseWeightPbs, gymLibraryExercises]);
+  const selectedPbExerciseId = useMemo(
+    () => (pbModalExercise ? resolveSessionExercisePbId(pbModalExercise) : null),
+    [pbModalExercise, resolveSessionExercisePbId],
+  );
+  const selectedExercisePbRows = useMemo(() => {
+    if (!selectedPbExerciseId) return [];
+    const rows = pruneDominatedPbRows(exerciseWeightPbs.filter((entry) => entry.exerciseId === selectedPbExerciseId));
+    return rows.sort((a, b) => {
+      if (pbSortMode === 'reps_desc') {
+        if (b.bestReps !== a.bestReps) return b.bestReps - a.bestReps;
+        return b.weightKey - a.weightKey;
+      }
+      if (pbSortMode === 'reps_asc') {
+        if (a.bestReps !== b.bestReps) return a.bestReps - b.bestReps;
+        return a.weightKey - b.weightKey;
+      }
+      if (pbSortMode === 'weight_desc') return b.weightKey - a.weightKey;
+      if (pbSortMode === 'weight_asc') return a.weightKey - b.weightKey;
+      return new Date(b.date).getTime() - new Date(a.date).getTime();
+    });
+  }, [exerciseWeightPbs, pbSortMode, selectedPbExerciseId]);
+  const cyclePbSortMode = () => {
+    const idx = PB_SORT_ORDER.indexOf(pbSortMode);
+    const nextIdx = (idx + 1) % PB_SORT_ORDER.length;
+    setPbSortMode(PB_SORT_ORDER[nextIdx]);
+  };
+  const openPbModal = (exercise: SessionExercise) => {
+    setPbModalExercise(exercise);
+  };
+  const openPbModalByExerciseId = (exerciseId: string, displayName: string) => {
+    setPbModalExercise({
+      id: `pb-overview-${exerciseId}`,
+      libraryExerciseId: exerciseId.startsWith('name:') ? undefined : exerciseId,
+      name: displayName,
+      sets: [],
+    });
+  };
+  const closePbModal = () => {
+    setPbModalExercise(null);
+  };
+  const confirmAbortWorkout = () => {
+    Alert.alert(
+      'Avbryta pass?',
+      'Vill du avbryta passet? Passet sparas inte.',
+      [
+        { text: 'Nej', style: 'cancel' },
+        { text: 'Avbryt pass', style: 'destructive', onPress: endSessionWithoutSaving },
+      ],
+    );
+  };
 
   const openLibrary = (mode: 'session' | 'builder') => {
     setLibraryMode(mode);
     setGymSheetExpanded(true);
-    gymSheetTranslateY.setValue(0);
+    gymSheetTranslateY.setValue(80);
+    setGymLibraryQuery('');
+    setGymLibraryFilter(null);
+    setGymLibraryEquipmentFilter(null);
     setGymLibraryVisible(true);
   };
+  useEffect(() => {
+    if (gymLibraryVisible) {
+      Animated.spring(gymSheetTranslateY, {
+        toValue: 0,
+        useNativeDriver: true,
+        damping: 22,
+        stiffness: 220,
+      }).start();
+    }
+  }, [gymLibraryVisible, gymSheetTranslateY]);
 
   const addLibraryExercise = (exercise: LibraryExercise) => {
     if (!libraryMode) return;
     if (libraryMode === 'session') {
-      setSessionExercises((prev) => [...prev, { id: `${Date.now()}-${Math.random()}`, name: exercise.name, sets: [] }]);
+      setSessionExercises((prev) => [...prev, { id: `${Date.now()}-${Math.random()}`, libraryExerciseId: exercise.id, name: exercise.name, sets: [] }]);
     } else {
-      setBuilderExercises((prev) => [...prev, { id: `${Date.now()}-${Math.random()}`, name: exercise.name, sets: 3, reps: 10 }]);
+      setBuilderExercises((prev) => [...prev, { id: `${Date.now()}-${Math.random()}`, libraryExerciseId: exercise.id, name: exercise.name, sets: 1, reps: 10, repsPerSet: [10] }]);
     }
     setGymLibraryVisible(false);
     setLibraryMode(null);
@@ -601,18 +1092,29 @@ function TrainingScreen({
         query.length === 0 ||
         exercise.name.toLowerCase().includes(query) ||
         exercise.tags.some((tag) => tag.toLowerCase().includes(query));
-      const matchesFilter = !gymLibraryFilter || exercise.tags.includes(gymLibraryFilter);
-      return matchesQuery && matchesFilter;
+      const matchesBody = !gymLibraryFilter || exercise.tags.includes(gymLibraryFilter);
+      const matchesEquipment = !gymLibraryEquipmentFilter || exercise.tags.includes(gymLibraryEquipmentFilter);
+      return matchesQuery && matchesBody && matchesEquipment;
     });
-  }, [gymLibraryExercises, gymLibraryFilter, gymLibraryQuery]);
+  }, [gymLibraryExercises, gymLibraryFilter, gymLibraryEquipmentFilter, gymLibraryQuery]);
   const gymBodyPartFilters = useMemo(
-    () => [...new Set(gymLibraryExercises.flatMap((exercise) => exercise.tags))],
+    () =>
+      [...new Set(gymLibraryExercises.flatMap((e) => e.tags))].filter(
+        (tag) => !GYM_EQUIPMENT_SET.has(tag),
+      ),
     [gymLibraryExercises],
   );
   const gymCategoryChoices = useMemo(() => {
-    const combined = [...gymBodyPartFilters, ...gymCategoryDraftTags];
+    const combined = [...gymBodyPartFilters, ...GYM_EQUIPMENT_TAGS, ...gymCategoryDraftTags];
     return [...new Set(combined)].sort((a, b) => a.localeCompare(b, 'sv-SE'));
   }, [gymBodyPartFilters, gymCategoryDraftTags]);
+  const gymOtherDraftTags = useMemo(
+    () =>
+      gymCategoryDraftTags.filter(
+        (tag) => !gymBodyPartFilters.includes(tag) && !GYM_EQUIPMENT_TAGS.includes(tag),
+      ),
+    [gymCategoryDraftTags, gymBodyPartFilters],
+  );
   const hasExactGymMatch = useMemo(() => {
     const query = gymLibraryQuery.trim().toLowerCase();
     if (query.length === 0) return true;
@@ -632,6 +1134,7 @@ function TrainingScreen({
       addLibraryExercise(nextExercise);
       setGymLibraryQuery('');
       setGymLibraryFilter(null);
+      setGymLibraryEquipmentFilter(null);
     }
   };
   const openGymCategoryEditor = (exercise: LibraryExercise) => {
@@ -686,6 +1189,14 @@ function TrainingScreen({
       }),
     );
 
+  const sessionRemoveLastSet = (exerciseId: string) =>
+    setSessionExercises((prev) =>
+      prev.map((exercise) => {
+        if (exercise.id !== exerciseId) return exercise;
+        return { ...exercise, sets: exercise.sets.slice(0, -1) };
+      }),
+    );
+
   const sessionAdjustSet = (exerciseId: string, setId: string, field: 'reps' | 'weightKg', delta: number) =>
     setSessionExercises((prev) =>
       prev.map((exercise) =>
@@ -707,6 +1218,8 @@ function TrainingScreen({
     setSessionExercises([]);
     setSessionSourcePlanId(null);
     setSessionSourcePlanName(null);
+    setPbModalExercise(null);
+    setPbSummaryVisible(false);
     setSessionStartedAtIso(new Date().toISOString());
     setElapsedSeconds(0);
     setView('session');
@@ -719,21 +1232,32 @@ function TrainingScreen({
     setSessionExercises([]);
     setSessionSourcePlanId(null);
     setSessionSourcePlanName(null);
+    setPbModalExercise(null);
+    setPbSummaryVisible(false);
     setSessionStartedAtIso(null);
     setElapsedSeconds(0);
-    setView('home');
+    goHomeWithReverseTransition();
+  };
+
+  const getRepsPerSet = (ex: WorkoutPlanExercise): number[] => {
+    if (ex.repsPerSet && ex.repsPerSet.length > 0) return ex.repsPerSet;
+    return Array(ex.sets || 1).fill(ex.reps ?? 10);
   };
 
   const buildSessionExercisesFromPlan = (plan: WorkoutPlan): SessionExercise[] =>
-    plan.exercises.map((exercise) => ({
-      id: `${Date.now()}-${Math.random()}`,
-      name: exercise.name,
-      sets: Array.from({ length: exercise.sets }, () => ({
+    plan.exercises.map((exercise) => {
+      const rp = getRepsPerSet(exercise);
+      return {
         id: `${Date.now()}-${Math.random()}`,
-        reps: exercise.reps,
-        weightKg: 0,
-      })),
-    }));
+        libraryExerciseId: exercise.libraryExerciseId,
+        name: exercise.name,
+        sets: rp.map((reps) => ({
+          id: `${Date.now()}-${Math.random()}`,
+          reps,
+          weightKg: 0,
+        })),
+      };
+    });
 
   const startWorkoutFromPlan = (plan: WorkoutPlan) => {
     setSessionExercises(buildSessionExercisesFromPlan(plan));
@@ -747,8 +1271,23 @@ function TrainingScreen({
   const loadPlanForEditing = (plan: WorkoutPlan) => {
     setEditingPlanId(plan.id);
     setBuilderName(plan.name);
-    setBuilderExercises(plan.exercises.map((exercise) => ({ ...exercise })));
+    setBuilderExercises(
+      plan.exercises.map((exercise) => {
+        const rp = getRepsPerSet(exercise);
+        return { ...exercise, repsPerSet: rp, sets: rp.length, reps: rp[0] ?? 10 };
+      }),
+    );
     setView('builder');
+  };
+
+  const openPlanDetail = (plan: WorkoutPlan) => {
+    setSelectedPlanId(plan.id);
+    setView('planDetail');
+  };
+
+  const goBackToSaved = () => {
+    setSelectedPlanId(null);
+    setView('saved');
   };
 
   const commitCompletedWorkout = () => {
@@ -759,6 +1298,33 @@ function TrainingScreen({
     }
     const endedAtIso = new Date().toISOString();
     const durationSec = Math.max(0, Math.floor((new Date(endedAtIso).getTime() - new Date(sessionStartedAtIso).getTime()) / 1000));
+    if (sessionPbEvents.length > 0) {
+      setExerciseWeightPbs((prev) => {
+        const byKey = new Map(prev.map((entry) => [`${entry.exerciseId}|${entry.weightKey}`, entry]));
+        sessionPbEvents.forEach((event) => {
+          const key = `${event.exerciseId}|${event.weightKey}`;
+          const existing = byKey.get(key);
+          if (!existing || event.newBestReps > existing.bestReps) {
+            byKey.set(key, {
+              exerciseId: event.exerciseId,
+              weightKey: event.weightKey,
+              bestReps: event.newBestReps,
+              date: endedAtIso,
+            });
+          }
+        });
+        const grouped = new Map<string, ExerciseWeightPb[]>();
+        [...byKey.values()].forEach((entry) => {
+          const list = grouped.get(entry.exerciseId) ?? [];
+          grouped.set(entry.exerciseId, [...list, entry]);
+        });
+        const pruned: ExerciseWeightPb[] = [];
+        grouped.forEach((rows) => {
+          pruned.push(...pruneDominatedPbRows(rows));
+        });
+        return pruned;
+      });
+    }
     setCompletedWorkouts((prev) => [
       {
         id: `${Date.now()}`,
@@ -772,20 +1338,22 @@ function TrainingScreen({
       ...prev,
     ]);
     endSessionWithoutSaving();
+    if (sessionPbEvents.length > 0) {
+      const maxRows = 8;
+      const rows = [...sessionPbEvents]
+        .sort((a, b) => a.exerciseName.localeCompare(b.exerciseName, 'sv-SE'))
+        .slice(0, maxRows);
+      setPbSummaryRows(rows);
+      setPbSummaryTotal(sessionPbEvents.length);
+      setPbSummaryVisible(true);
+    }
   };
   const saveCompletedWorkout = () => {
     if (!hasLoggedSessionContent) {
       endSessionWithoutSaving();
       return;
     }
-    Alert.alert(
-      'Avsluta pass?',
-      'Vill du avsluta och spara ditt pass?',
-      [
-        { text: 'Avbryt', style: 'cancel' },
-        { text: 'Spara pass', onPress: commitCompletedWorkout },
-      ],
-    );
+    setSessionConfirmVisible(true);
   };
 
   const resolveWorkoutDisplay = (workout: CompletedWorkout) => {
@@ -830,7 +1398,11 @@ function TrainingScreen({
   };
   const deleteSelectedHistoryWorkouts = () => {
     if (selectedHistoryWorkoutIds.length === 0) return;
-    setCompletedWorkouts((prev) => prev.filter((item) => !selectedHistoryWorkoutIds.includes(item.id)));
+    setCompletedWorkouts((prev) => {
+      const next = prev.filter((item) => !selectedHistoryWorkoutIds.includes(item.id));
+      setExerciseWeightPbs(rebuildExerciseWeightPbsFromWorkouts(next));
+      return next;
+    });
     setSelectedHistoryWorkoutIds([]);
     setHistorySelectionMode(false);
   };
@@ -861,27 +1433,190 @@ function TrainingScreen({
       setGymSheetExpanded(false);
     });
   }, [gymSheetMaxDrag, gymSheetTranslateY]);
+  const getFallbackContainerRect = useCallback((): CardRect => {
+    const windowRect = Dimensions.get('window');
+    return {
+      x: 0,
+      y: insets.top,
+      width: windowRect.width,
+      height: windowRect.height - insets.top,
+    };
+  }, [insets.top]);
+
+  const measureRefRect = useCallback((ref: React.RefObject<View | null>) => new Promise<CardRect | null>((resolve) => {
+    const node = ref.current as (View & { measureInWindow?: (cb: (x: number, y: number, width: number, height: number) => void) => void }) | null;
+    if (!node || typeof node.measureInWindow !== 'function') {
+      resolve(null);
+      return;
+    }
+    node.measureInWindow((x, y, width, height) => {
+      if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+        resolve(null);
+        return;
+      }
+      resolve({ x, y, width, height });
+    });
+  }), []);
+  const runCardOpenTransition = useCallback(async (
+    nextView: Exclude<TrainingView, 'home'>,
+    cardRef: React.RefObject<View | null>,
+    beforeOpen?: () => void,
+  ) => {
+    if (transitionBusyRef.current) return;
+    transitionBusyRef.current = true;
+    setPressedCardView(nextView);
+    cardPressAnim.setValue(1);
+    Animated.timing(cardPressAnim, {
+      toValue: 0.95,
+      duration: 80,
+      easing: Easing.out(Easing.cubic),
+      useNativeDriver: true,
+    }).start();
+    setTransitionMode('opening');
+    setTransitionPreviewView(nextView);
+    setLastClosedView(null);
+    transitionBeforeOpenRef.current = beforeOpen ?? null;
+    const [origin, container] = await Promise.all([
+      measureRefRect(cardRef),
+      measureRefRect(trainingViewRef),
+    ]);
+    if (!origin || !container) {
+      transitionBeforeOpenRef.current?.();
+      transitionBeforeOpenRef.current = null;
+      setView(nextView);
+      setTransitionMode('idle');
+      setTransitionPreviewView(null);
+      cardPressAnim.setValue(1);
+      setPressedCardView(null);
+      transitionBusyRef.current = false;
+      return;
+    }
+    setTransitionContainerRect(container);
+    setTransitionOriginRect(origin);
+    setTransitionActive(true);
+    transitionAnim.setValue(0);
+    transitionBlurOpacity.setValue(0);
+    Animated.timing(transitionAnim, {
+      toValue: 1,
+      duration: 360,
+      easing: Easing.out(Easing.cubic),
+      useNativeDriver: true,
+    }).start(() => {
+      transitionBeforeOpenRef.current?.();
+      transitionBeforeOpenRef.current = null;
+      setView(nextView);
+      lastOriginByViewRef.current[nextView] = origin;
+      cardPressAnim.setValue(1);
+      setPressedCardView(null);
+      requestAnimationFrame(() => {
+        setTransitionActive(false);
+        setTransitionOriginRect(null);
+        setTransitionMode('idle');
+        setTransitionPreviewView(null);
+        transitionBusyRef.current = false;
+      });
+    });
+  }, [measureRefRect, transitionAnim]);
+
+  const cardRefByView: Record<string, React.RefObject<View | null>> = {
+    session: startCardRef,
+    builder: builderCardRef,
+    saved: savedCardRef,
+    preloaded: preloadedCardRef,
+    pbOverview: pbCardRef,
+  };
+
+  const runCardBounce = useCallback(() => {
+    cardBounceAnim.setValue(0.92);
+    Animated.spring(cardBounceAnim, {
+      toValue: 1,
+      friction: 4,
+      tension: 200,
+      useNativeDriver: true,
+    }).start();
+  }, [cardBounceAnim]);
+
+  const goHomeWithReverseTransition = useCallback(async () => {
+    if (view === 'home' || transitionBusyRef.current) {
+      return;
+    }
+    transitionBusyRef.current = true;
+    const closingView = view as Exclude<TrainingView, 'home'>;
+    const shouldClearSession = closingView === 'session' && sessionExercises.length === 0;
+    setTransitionMode('closing');
+    setTransitionPreviewView(closingView);
+    const lastOrigin = lastOriginByViewRef.current[closingView] ?? null;
+    const container = await measureRefRect(trainingViewRef);
+    if (!lastOrigin || !container) {
+      if (shouldClearSession) {
+        setSessionExercises([]);
+        setSessionSourcePlanId(null);
+        setSessionSourcePlanName(null);
+        setPbModalExercise(null);
+        setPbSummaryVisible(false);
+        setSessionStartedAtIso(null);
+        setElapsedSeconds(0);
+      }
+      setView('home');
+      setTransitionMode('idle');
+      setTransitionPreviewView(null);
+      transitionBusyRef.current = false;
+      return;
+    }
+    setTransitionContainerRect(container);
+    setTransitionOriginRect(lastOrigin);
+    setTransitionActive(true);
+    transitionAnim.setValue(1);
+    setView('home');
+    Animated.timing(transitionAnim, {
+      toValue: 0,
+      duration: 320,
+      easing: Easing.inOut(Easing.cubic),
+      useNativeDriver: true,
+    }).start(() => {
+      if (shouldClearSession) {
+        setSessionExercises([]);
+        setSessionSourcePlanId(null);
+        setSessionSourcePlanName(null);
+        setPbModalExercise(null);
+        setPbSummaryVisible(false);
+        setSessionStartedAtIso(null);
+        setElapsedSeconds(0);
+      }
+      setTransitionActive(false);
+      setTransitionOriginRect(null);
+      transitionAnim.setValue(1);
+      setTransitionMode('idle');
+      setTransitionPreviewView(null);
+      transitionBusyRef.current = false;
+      setLastClosedView(closingView);
+      runCardBounce();
+    });
+  }, [measureRefRect, transitionAnim, runCardBounce, sessionExercises.length, view]);
+
   useEffect(() => {
     const onBackPress = () => {
       if (view === 'home') return false;
       if (gymLibraryVisible) {
         closeGymLibrary();
+      } else if (view === 'planDetail') {
+        goBackToSaved();
       } else {
-        setView('home');
+        goHomeWithReverseTransition();
       }
       return true;
     };
 
     const sub = BackHandler.addEventListener('hardwareBackPress', onBackPress);
     return () => sub.remove();
-  }, [closeGymLibrary, gymLibraryVisible, view]);
+  }, [closeGymLibrary, goHomeWithReverseTransition, goBackToSaved, gymLibraryVisible, view]);
   const gymSheetCloseThreshold = Math.round(gymSheetMaxDrag * 0.25);
   const gymSheetPanResponder = useRef(
     PanResponder.create({
       onStartShouldSetPanResponder: () => true,
       onStartShouldSetPanResponderCapture: () => false,
-      onMoveShouldSetPanResponder: (_, gesture) => gesture.dy > 6,
-      onMoveShouldSetPanResponderCapture: (_, gesture) => gesture.dy > 6,
+      onMoveShouldSetPanResponder: (_, gesture) => Math.abs(gesture.dy) > 8 && Math.abs(gesture.dy) > Math.abs(gesture.dx),
+      onMoveShouldSetPanResponderCapture: (_, gesture) => Math.abs(gesture.dy) > 8 && Math.abs(gesture.dy) > Math.abs(gesture.dx),
       onPanResponderTerminationRequest: () => false,
       onPanResponderGrant: () => {
         gymSheetTranslateY.stopAnimation((value) => {
@@ -908,54 +1643,327 @@ function TrainingScreen({
     }),
   ).current;
 
+  const builderUpdateSetReps = (exerciseId: string, setIndex: number, delta: number) => {
+    setBuilderExercises((prev) =>
+      prev.map((e) => {
+        if (e.id !== exerciseId) return e;
+        const rp = getRepsPerSet(e);
+        if (setIndex < 0 || setIndex >= rp.length) return e;
+        const next = [...rp];
+        next[setIndex] = Math.max(1, Math.min(99, next[setIndex] + delta));
+        return { ...e, repsPerSet: next, sets: next.length, reps: next[0] ?? 10 };
+      }),
+    );
+  };
+
+  const builderAddSet = (exerciseId: string) => {
+    setBuilderExercises((prev) =>
+      prev.map((e) => {
+        if (e.id !== exerciseId) return e;
+        const rp = getRepsPerSet(e);
+        const last = rp[rp.length - 1] ?? 10;
+        const next = [...rp, last];
+        return { ...e, repsPerSet: next, sets: next.length, reps: next[0] ?? 10 };
+      }),
+    );
+  };
+
+  const builderRemoveSet = (exerciseId: string) => {
+    setBuilderExercises((prev) =>
+      prev.map((e) => {
+        if (e.id !== exerciseId) return e;
+        const rp = getRepsPerSet(e);
+        if (rp.length <= 1) return e;
+        const next = rp.slice(0, -1);
+        return { ...e, repsPerSet: next, sets: next.length, reps: next[0] ?? 10 };
+      }),
+    );
+  };
+
   const saveBuilderPlan = () => {
     if (builderExercises.length === 0) {
       Alert.alert('Inget att spara', 'Lägg till minst en övning innan du sparar passet.');
       return;
     }
+    setBuilderConfirmVisible(false);
     const name = builderName.trim() || `Pass ${new Intl.DateTimeFormat('sv-SE', { day: '2-digit', month: '2-digit' }).format(new Date())}`;
+    const exercisesToSave = builderExercises.map((exercise) => {
+      const rp = getRepsPerSet(exercise);
+      return { ...exercise, repsPerSet: rp, sets: rp.length, reps: rp[0] ?? 10 };
+    });
     setWorkoutPlans((prev) => {
       if (editingPlanId) {
         return prev.map((plan) =>
-          plan.id === editingPlanId ? { ...plan, name, exercises: builderExercises.map((exercise) => ({ ...exercise })) } : plan,
+          plan.id === editingPlanId ? { ...plan, name, exercises: exercisesToSave } : plan,
         );
       }
       return [
-        { id: `${Date.now()}`, name, exercises: builderExercises.map((exercise) => ({ ...exercise })), createdAtIso: new Date().toISOString() },
+        { id: `${Date.now()}`, name, exercises: exercisesToSave, createdAtIso: new Date().toISOString() },
         ...prev,
       ];
     });
     setBuilderName('');
     setBuilderExercises([]);
     setEditingPlanId(null);
-    setView('home');
+    goHomeWithReverseTransition();
   };
+
+  const openBuilderConfirm = () => {
+    if (builderExercises.length === 0) {
+      Alert.alert('Inget att spara', 'Lägg till minst en övning innan du sparar passet.');
+      return;
+    }
+    setBuilderConfirmVisible(true);
+  };
+
+  const confirmDeletePlan = (planId: string, planName: string, onDeleted?: () => void) => {
+    Alert.alert(
+      'Ta bort pass?',
+      `Vill du ta bort "${planName}"? Det går inte att ångra.`,
+      [
+        { text: 'Avbryt', style: 'cancel' },
+        {
+          text: 'Ta bort',
+          style: 'destructive',
+          onPress: () => {
+            setWorkoutPlans((prev) => prev.filter((p) => p.id !== planId));
+            onDeleted?.();
+          },
+        },
+      ],
+    );
+  };
+
+  useEffect(() => {
+    if (view === 'session') {
+      onFabActionChange(() => openLibrary('session'));
+      return;
+    }
+    if (view === 'builder') {
+      onFabActionChange(() => openLibrary('builder'));
+      return;
+    }
+    if (view === 'historyDetail') {
+      onFabActionChange(() => {
+        setView('builder');
+        openLibrary('builder');
+      });
+      return;
+    }
+    if (view === 'planDetail') {
+      onFabActionChange(null);
+      return;
+    }
+    onFabActionChange(() => setView('builder'));
+    return () => onFabActionChange(null);
+  }, [onFabActionChange, view, openLibrary]);
+
+  const windowRect = Dimensions.get('window');
+  const containerRect = transitionContainerRect ?? {
+    x: 0,
+    y: insets.top,
+    width: windowRect.width,
+    height: windowRect.height - insets.top,
+  };
+  const hasOriginTransition = transitionActive && !!transitionOriginRect;
+  const startScaleX = hasOriginTransition && transitionOriginRect
+    ? Math.max(MIN_CARD_TRANSITION_SCALE, transitionOriginRect.width / containerRect.width)
+    : 0.98;
+  const startScaleY = hasOriginTransition && transitionOriginRect
+    ? Math.max(MIN_CARD_TRANSITION_SCALE, transitionOriginRect.height / containerRect.height)
+    : 0.98;
+  const offsetX = hasOriginTransition && transitionOriginRect
+    ? (transitionOriginRect.x + transitionOriginRect.width / 2) - (containerRect.x + containerRect.width / 2)
+    : 0;
+  const offsetY = hasOriginTransition && transitionOriginRect
+    ? (transitionOriginRect.y + transitionOriginRect.height / 2) - (containerRect.y + containerRect.height / 2)
+    : 0;
+  const transitionOpacity = transitionAnim.interpolate({
+    inputRange: [0, 1],
+    outputRange: [0.82, 1],
+  });
+  const transitionScaleX = transitionAnim.interpolate({
+    inputRange: [0, 1],
+    outputRange: [startScaleX, 1],
+  });
+  const transitionScaleY = transitionAnim.interpolate({
+    inputRange: [0, 1],
+    outputRange: [startScaleY, 1],
+  });
+  const transitionCornerRadius = transitionAnim.interpolate({
+    inputRange: [0, 0.85, 1],
+    outputRange: [CARD_TRANSITION_CORNER_RADIUS, 2, 0],
+    extrapolate: 'clamp',
+  });
+  const transitionPreviewFadeOpacity = transitionMode === 'opening'
+    ? transitionAnim.interpolate({
+        inputRange: [0, 0.4, 1],
+        outputRange: [0, 1, 1],
+        extrapolate: 'clamp',
+      })
+    : transitionAnim.interpolate({
+        inputRange: [0, 0.15, 1],
+        outputRange: [0, 1, 1],
+        extrapolate: 'clamp',
+      });
+  const transitionContentFadeOpacity = transitionAnim.interpolate({
+    inputRange: [0, 1],
+    outputRange: [0, 1],
+    extrapolate: 'clamp',
+  });
+  const transitionTranslateX = transitionAnim.interpolate({
+    inputRange: [0, 1],
+    outputRange: [offsetX, 0],
+  });
+  const transitionTranslateY = transitionAnim.interpolate({
+    inputRange: [0, 1],
+    outputRange: [offsetY, 0],
+  });
+  const shouldHoldSourceView = transitionMode === 'opening';
+  const shouldFreezeMainView = transitionMode === 'opening' || transitionMode === 'closing';
+  const showTransitionPreview = transitionActive
+    && (transitionMode === 'opening' || transitionMode === 'closing')
+    && !!transitionPreviewView;
+  const currentTransitionOpacity = shouldFreezeMainView ? 1 : transitionOpacity;
+  const currentTransitionTranslateX = shouldFreezeMainView ? 0 : transitionTranslateX;
+  const currentTransitionTranslateY = shouldFreezeMainView ? 0 : transitionTranslateY;
+  const currentTransitionScaleX = shouldFreezeMainView ? 1 : transitionScaleX;
+  const currentTransitionScaleY = shouldFreezeMainView ? 1 : transitionScaleY;
 
   return (
     <View style={[styles.screen, { paddingTop: insets.top }]}>
       <Text style={styles.screenTitleSmall}>Träning</Text>
+      <View style={styles.trainingTransitionHost}>
+        <Animated.View
+          ref={trainingViewRef}
+          style={[
+            styles.trainingViewWrap,
+            {
+              opacity: currentTransitionOpacity,
+              transform: [
+                { translateX: currentTransitionTranslateX },
+                { translateY: currentTransitionTranslateY },
+                { scaleX: currentTransitionScaleX },
+                { scaleY: currentTransitionScaleY },
+              ],
+            },
+          ]}
+        >
       {view === 'home' ? (
         <ScrollView contentContainerStyle={styles.listContent}>
+          {/* Primär kort: Starta träning / Fortsätt pågående */}
           {sessionStartedAtIso ? (
-            <Animated.View style={{ transform: [{ scale: pulseAnim }] }}>
-              <Pressable style={[styles.trainingPrimaryAction, styles.ongoingWorkoutButton]} onPress={() => setView('session')}>
-                <Text style={styles.trainingPrimaryTitle}>Fortsätt pågående pass</Text>
-                <Text style={styles.ongoingWorkoutText}>Tid: {formatDuration(elapsedSeconds)}</Text>
+            <Animated.View style={{ transform: [{ scale: pulseAnim }, { scale: lastClosedView === 'session' ? cardBounceAnim : 1 }, { scale: pressedCardView === 'session' ? cardPressAnim : 1 }] }}>
+              <Pressable
+                ref={startCardRef}
+                style={styles.trainingHomeCard}
+                onPress={() => runCardOpenTransition('session', startCardRef)}
+              >
+                <View style={[styles.trainingHomeCardIconWrap, { backgroundColor: '#4CAF50' }]}>
+                  <MaterialCommunityIcons name="run" size={24} color="#FFFFFF" />
+                </View>
+                <View style={styles.trainingHomeCardTextWrap}>
+                  <Text style={styles.trainingHomeCardTitle}>Fortsätt pågående pass</Text>
+                  <Text style={styles.trainingHomeCardSubtitle}>Tid: {formatDuration(elapsedSeconds)}</Text>
+                </View>
+                <MaterialIcons name="chevron-right" size={24} color="#8FA1B3" />
               </Pressable>
             </Animated.View>
           ) : (
-            <Pressable style={styles.trainingPrimaryAction} onPress={startWorkout}>
-              <Text style={styles.trainingPrimaryTitle}>Starta träning</Text>
-              <Text style={styles.trainingPrimarySubtitle}>Starta nytt pass från scratch</Text>
+            <Animated.View style={{ transform: [{ scale: lastClosedView === 'session' ? cardBounceAnim : 1 }, { scale: pressedCardView === 'session' ? cardPressAnim : 1 }] }}>
+            <Pressable
+              ref={startCardRef}
+              style={styles.trainingHomeCard}
+              onPress={() => runCardOpenTransition('session', startCardRef, () => {
+                setSessionExercises([]);
+                setSessionSourcePlanId(null);
+                setSessionSourcePlanName(null);
+                setPbModalExercise(null);
+                setPbSummaryVisible(false);
+                setSessionStartedAtIso(new Date().toISOString());
+                setElapsedSeconds(0);
+              })}
+            >
+              <View style={[styles.trainingHomeCardIconWrap, { backgroundColor: '#4CAF50' }]}>
+                <MaterialCommunityIcons name="dumbbell" size={24} color="#FFFFFF" />
+              </View>
+              <View style={styles.trainingHomeCardTextWrap}>
+                <Text style={styles.trainingHomeCardTitle}>Starta träning</Text>
+                <Text style={styles.trainingHomeCardSubtitle}>Starta nytt pass från scratch</Text>
+              </View>
+              <MaterialIcons name="chevron-right" size={24} color="#8FA1B3" />
             </Pressable>
+            </Animated.View>
           )}
-          <View style={styles.trainingHomeButtonsRow}>
-            <Button mode="outlined" style={styles.trainingHomeButton} contentStyle={styles.trainingHomeButtonContent} onPress={() => { setBuilderName(''); setBuilderExercises([]); setEditingPlanId(null); setView('builder'); }}>
-              Skapa pass
-            </Button>
-            <Button mode="outlined" style={styles.trainingHomeButton} contentStyle={styles.trainingHomeButtonContent} onPress={() => setView('saved')}>
-              Mina pass
-            </Button>
+          {/* Rad: Skapa pass | Mina pass */}
+          <View style={styles.trainingHomeCardRow}>
+            <Animated.View style={[styles.trainingHomeCardHalf, { transform: [{ scale: lastClosedView === 'builder' ? cardBounceAnim : 1 }, { scale: pressedCardView === 'builder' ? cardPressAnim : 1 }] }]}>
+            <Pressable
+              ref={builderCardRef}
+              style={styles.trainingHomeCardStacked}
+              onPress={() => runCardOpenTransition('builder', builderCardRef, () => {
+                setBuilderName('');
+                setBuilderExercises([]);
+                setEditingPlanId(null);
+              })}
+            >
+              <View style={styles.trainingHomeCardStackedTop}>
+                <View style={[styles.trainingHomeCardIconWrap, { backgroundColor: '#2196F3' }]}>
+                  <MaterialIcons name="add-circle-outline" size={24} color="#FFFFFF" />
+                </View>
+                <MaterialIcons name="chevron-right" size={24} color="#8FA1B3" />
+              </View>
+              <Text style={styles.trainingHomeCardTitle} numberOfLines={1} ellipsizeMode="tail">Skapa pass</Text>
+            </Pressable>
+            </Animated.View>
+            <Animated.View style={[styles.trainingHomeCardHalf, { transform: [{ scale: lastClosedView === 'saved' ? cardBounceAnim : 1 }, { scale: pressedCardView === 'saved' ? cardPressAnim : 1 }] }]}>
+            <Pressable
+              ref={savedCardRef}
+              style={styles.trainingHomeCardStacked}
+              onPress={() => runCardOpenTransition('saved', savedCardRef)}
+            >
+              <View style={styles.trainingHomeCardStackedTop}>
+                <View style={[styles.trainingHomeCardIconWrap, { backgroundColor: '#9C27B0' }]}>
+                  <MaterialIcons name="list-alt" size={24} color="#FFFFFF" />
+                </View>
+                <MaterialIcons name="chevron-right" size={24} color="#8FA1B3" />
+              </View>
+              <Text style={styles.trainingHomeCardTitle} numberOfLines={1} ellipsizeMode="tail">Mina pass</Text>
+            </Pressable>
+            </Animated.View>
+          </View>
+          {/* Rad: Förinlagda pass | Mina PB's */}
+          <View style={styles.trainingHomeCardRow}>
+            <Animated.View style={[styles.trainingHomeCardHalf, { transform: [{ scale: lastClosedView === 'preloaded' ? cardBounceAnim : 1 }, { scale: pressedCardView === 'preloaded' ? cardPressAnim : 1 }] }]}>
+            <Pressable
+              ref={preloadedCardRef}
+              style={styles.trainingHomeCardStacked}
+              onPress={() => runCardOpenTransition('preloaded', preloadedCardRef)}
+            >
+              <View style={styles.trainingHomeCardStackedTop}>
+                <View style={[styles.trainingHomeCardIconWrap, { backgroundColor: '#009688' }]}>
+                  <MaterialCommunityIcons name="calendar-check" size={24} color="#FFFFFF" />
+                </View>
+                <MaterialIcons name="chevron-right" size={24} color="#8FA1B3" />
+              </View>
+              <Text style={styles.trainingHomeCardTitle} numberOfLines={1} ellipsizeMode="tail">Förinlagda pass</Text>
+            </Pressable>
+            </Animated.View>
+            <Animated.View style={[styles.trainingHomeCardHalf, { transform: [{ scale: lastClosedView === 'pbOverview' ? cardBounceAnim : 1 }, { scale: pressedCardView === 'pbOverview' ? cardPressAnim : 1 }] }]}>
+            <Pressable
+              ref={pbCardRef}
+              style={styles.trainingHomeCardStacked}
+              onPress={() => runCardOpenTransition('pbOverview', pbCardRef)}
+            >
+              <View style={styles.trainingHomeCardStackedTop}>
+                <View style={[styles.trainingHomeCardIconWrap, { backgroundColor: '#FF9800' }]}>
+                  <MaterialCommunityIcons name="trophy" size={24} color="#FFFFFF" />
+                </View>
+                <MaterialIcons name="chevron-right" size={24} color="#8FA1B3" />
+              </View>
+              <Text style={styles.trainingHomeCardTitle} numberOfLines={1} ellipsizeMode="tail">Mina PB&apos;s</Text>
+            </Pressable>
+            </Animated.View>
           </View>
           <View style={styles.historyHeaderRow}>
             <Text style={styles.trainingSectionTitle}>Historik</Text>
@@ -1000,14 +2008,29 @@ function TrainingScreen({
       {view === 'session' ? (
         <View style={styles.screen}>
           <View style={styles.trainingSessionTop}>
-            <Text style={styles.trainingTimer}>{formatDuration(elapsedSeconds)}</Text>
+            <View style={styles.trainingSessionTopRow}>
+              <Pressable style={styles.trainingMiniButton} onPress={goHomeWithReverseTransition}>
+                <MaterialIcons name="arrow-back" size={20} color="#DCE4EC" />
+              </Pressable>
+              <Text style={styles.trainingTimer}>{formatDuration(elapsedSeconds)}</Text>
+              <View style={styles.trainingTopActionsRight}>
+                <Pressable style={styles.trainingMiniPrimaryButton} onPress={saveCompletedWorkout}>
+                  <MaterialIcons name="check" size={20} color="#0F1419" />
+                </Pressable>
+                <Pressable style={styles.trainingMiniDangerButton} onPress={confirmAbortWorkout}>
+                  <MaterialIcons name="delete-outline" size={20} color="#EF9A9A" />
+                </Pressable>
+              </View>
+            </View>
           </View>
           <ScrollView contentContainerStyle={styles.listContent}>
             {sessionExercises.length === 0 ? <Text style={styles.loggedSetEmpty}>Inga övningar än. Tryck på ＋.</Text> : null}
             {sessionExercises.map((exercise) => (
               <View key={exercise.id} style={styles.trainingCard}>
                 <View style={styles.trainingHeader}>
-                  <Text style={styles.trainingTitle}>{exercise.name}</Text>
+                  <Pressable onPress={() => openPbModal(exercise)}>
+                    <Text style={styles.trainingTitle}>{exercise.name}</Text>
+                  </Pressable>
                   <Pressable onPress={() => setSessionExercises((prev) => prev.filter((item) => item.id !== exercise.id))}>
                     <MaterialIcons name="delete" size={22} color="#EF9A9A" />
                   </Pressable>
@@ -1016,60 +2039,69 @@ function TrainingScreen({
                   {exercise.sets.length === 0 ? <Text style={styles.loggedSetEmpty}>Inga set ännu. Tryck på + Set.</Text> : null}
                   {exercise.sets.map((setEntry, index) => (
                     <View key={setEntry.id} style={styles.loggedSetRow}>
-                      <Text style={styles.loggedSetTitle}>Set {index + 1}</Text>
-                      <View style={styles.loggedSetMetrics}>
-                        <Text style={styles.loggedSetMetricLabel}>Reps</Text>
-                        <View style={styles.trainingStatActions}>
-                          <Pressable style={styles.trainingStatButton} onPress={() => sessionAdjustSet(exercise.id, setEntry.id, 'reps', -1)}>
-                            <Text style={styles.trainingStatButtonText}>-</Text>
-                          </Pressable>
-                          <Text style={styles.loggedSetMetricValue}>{setEntry.reps}</Text>
-                          <Pressable style={styles.trainingStatButton} onPress={() => sessionAdjustSet(exercise.id, setEntry.id, 'reps', 1)}>
-                            <Text style={styles.trainingStatButtonText}>+</Text>
-                          </Pressable>
+                      <View style={styles.loggedSetRowMain}>
+                        <Text style={styles.loggedSetTitle}>Set {index + 1}</Text>
+                        <View style={styles.loggedSetMetrics}>
+                          <Text style={styles.loggedSetMetricLabel}>Reps</Text>
+                          <View style={styles.trainingStatActions}>
+                            <Pressable style={styles.trainingStatButton} onPress={() => sessionAdjustSet(exercise.id, setEntry.id, 'reps', -1)}>
+                              <Text style={styles.trainingStatButtonText}>-</Text>
+                            </Pressable>
+                            <Text style={styles.loggedSetMetricValue}>{setEntry.reps}</Text>
+                            <Pressable style={styles.trainingStatButton} onPress={() => sessionAdjustSet(exercise.id, setEntry.id, 'reps', 1)}>
+                              <Text style={styles.trainingStatButtonText}>+</Text>
+                            </Pressable>
+                          </View>
+                        </View>
+                        <View style={styles.loggedSetMetrics}>
+                          <Text style={styles.loggedSetMetricLabel}>Vikt</Text>
+                          <View style={styles.trainingStatActions}>
+                            <Pressable style={styles.trainingStatButton} onPress={() => sessionAdjustSet(exercise.id, setEntry.id, 'weightKg', -2.5)}>
+                              <Text style={styles.trainingStatButtonText}>-</Text>
+                            </Pressable>
+                            <Text style={styles.loggedSetMetricValue}>{setEntry.weightKg} kg</Text>
+                            <Pressable style={styles.trainingStatButton} onPress={() => sessionAdjustSet(exercise.id, setEntry.id, 'weightKg', 2.5)}>
+                              <Text style={styles.trainingStatButtonText}>+</Text>
+                            </Pressable>
+                          </View>
                         </View>
                       </View>
-                      <View style={styles.loggedSetMetrics}>
-                        <Text style={styles.loggedSetMetricLabel}>Vikt</Text>
-                        <View style={styles.trainingStatActions}>
-                          <Pressable style={styles.trainingStatButton} onPress={() => sessionAdjustSet(exercise.id, setEntry.id, 'weightKg', -2.5)}>
-                            <Text style={styles.trainingStatButtonText}>-</Text>
-                          </Pressable>
-                          <Text style={styles.loggedSetMetricValue}>{setEntry.weightKg} kg</Text>
-                          <Pressable style={styles.trainingStatButton} onPress={() => sessionAdjustSet(exercise.id, setEntry.id, 'weightKg', 2.5)}>
-                            <Text style={styles.trainingStatButtonText}>+</Text>
-                          </Pressable>
-                        </View>
-                      </View>
+                      {(() => {
+                        const feedback = sessionSetFeedbackBySetKey.get(`${exercise.id}|${setEntry.id}`);
+                        if (!feedback) return null;
+                        return (
+                          <View style={styles.pbFeedbackBox}>
+                            <Text style={styles.pbFeedbackTitle}>{feedback.kind === 'new' ? '🏆 NYTT PB!' : 'Nuvarande PB'}</Text>
+                          </View>
+                        );
+                      })()}
                     </View>
                   ))}
                 </View>
                 <View style={styles.trainingButtons}>
+                  <Button
+                    mode="outlined"
+                    disabled={exercise.sets.length === 0}
+                    onPress={() => sessionRemoveLastSet(exercise.id)}
+                  >− Set</Button>
                   <Button mode="contained" onPress={() => sessionAddSet(exercise.id)}>+ Set</Button>
                 </View>
               </View>
             ))}
           </ScrollView>
-          <View style={styles.sessionBottomActions}>
-            <Pressable style={styles.sessionNavButton} onPress={() => setView('home')}>
-              <MaterialIcons name="arrow-back" size={24} color="#0F1419" />
-            </Pressable>
-            <Pressable style={styles.sessionFinishButton} onPress={saveCompletedWorkout}>
-              <Text style={styles.sessionFinishButtonText}>
-                {hasLoggedSessionContent ? 'Avsluta pass och spara' : 'Avsluta pass'}
-              </Text>
-            </Pressable>
-            <Pressable style={styles.sessionPlusButton} onPress={() => openLibrary('session')}>
-              <Text style={styles.sessionPlusButtonText}>+</Text>
-            </Pressable>
-          </View>
         </View>
       ) : null}
 
       {view === 'historyDetail' && selectedHistoryWorkout ? (
         <View style={styles.screen}>
           <View style={styles.trainingSessionTop}>
-            <Text style={styles.trainingTimer}>{resolveWorkoutDisplay(selectedHistoryWorkout).name}</Text>
+            <View style={styles.trainingSessionTopRow}>
+              <Pressable style={styles.trainingMiniButton} onPress={goHomeWithReverseTransition}>
+                <MaterialIcons name="arrow-back" size={20} color="#DCE4EC" />
+              </Pressable>
+              <Text style={styles.trainingTimer}>{resolveWorkoutDisplay(selectedHistoryWorkout).name}</Text>
+              <View style={styles.trainingTopActionsRight} />
+            </View>
             <Text style={styles.historyDetailMeta}>
               {resolveWorkoutDisplay(selectedHistoryWorkout).dateTimeLabel} • {resolveWorkoutDisplay(selectedHistoryWorkout).durationLabel}
             </Text>
@@ -1092,97 +2124,339 @@ function TrainingScreen({
               </View>
             ))}
           </ScrollView>
-          <View style={styles.sessionBottomActions}>
-            <Pressable style={styles.sessionFinishButton} onPress={() => setView('home')}>
-              <Text style={styles.sessionFinishButtonText}>Tillbaka</Text>
-            </Pressable>
-          </View>
         </View>
       ) : null}
 
       {view === 'builder' ? (
         <View style={styles.screen}>
           <View style={styles.trainingSessionTop}>
-            <Text style={styles.trainingTimer}>{editingPlanId ? 'Redigera pass' : 'Skapa pass'}</Text>
+            <View style={styles.trainingSessionTopRow}>
+              <Pressable style={styles.trainingMiniButton} onPress={() => { setEditingPlanId(null); goHomeWithReverseTransition(); }}>
+                <MaterialIcons name="arrow-back" size={20} color="#DCE4EC" />
+              </Pressable>
+              <Text style={styles.trainingTimer}>{editingPlanId ? 'Redigera pass' : 'Skapa pass'}</Text>
+              <View style={styles.trainingTopActionsRight}>
+                <Pressable style={styles.trainingMiniPrimaryButton} onPress={openBuilderConfirm}>
+                  <MaterialIcons name="check" size={20} color="#0F1419" />
+                </Pressable>
+              </View>
+            </View>
           </View>
           <ScrollView contentContainerStyle={styles.listContent}>
             <TextInput value={builderName} onChangeText={setBuilderName} style={styles.input} placeholder="Namn på pass" placeholderTextColor={PLACEHOLDER_COLOR} />
             {builderExercises.length === 0 ? <Text style={styles.loggedSetEmpty}>Lägg till övningar med ＋.</Text> : null}
-            {builderExercises.map((exercise) => (
-              <View key={exercise.id} style={styles.trainingCard}>
-                <View style={styles.trainingHeader}>
-                  <Text style={styles.trainingTitle}>{exercise.name}</Text>
-                  <Pressable onPress={() => setBuilderExercises((prev) => prev.filter((item) => item.id !== exercise.id))}>
-                    <MaterialIcons name="delete" size={22} color="#EF9A9A" />
-                  </Pressable>
-                </View>
-                <View style={styles.trainingBuilderRow}>
-                  <Text style={styles.loggedSetMetricLabel}>Set</Text>
-                  <View style={styles.trainingStatActions}>
-                    <Pressable style={styles.trainingStatButton} onPress={() => setBuilderExercises((prev) => prev.map((item) => item.id === exercise.id ? { ...item, sets: Math.max(1, Math.min(20, item.sets - 1)) } : item))}>
-                      <Text style={styles.trainingStatButtonText}>-</Text>
-                    </Pressable>
-                    <Text style={styles.loggedSetMetricValue}>{exercise.sets}</Text>
-                    <Pressable style={styles.trainingStatButton} onPress={() => setBuilderExercises((prev) => prev.map((item) => item.id === exercise.id ? { ...item, sets: Math.max(1, Math.min(20, item.sets + 1)) } : item))}>
-                      <Text style={styles.trainingStatButtonText}>+</Text>
+            {builderExercises.map((exercise) => {
+              const repsArr = getRepsPerSet(exercise);
+              return (
+                <View key={exercise.id} style={styles.trainingCard}>
+                  <View style={styles.trainingHeader}>
+                    <Text style={styles.trainingTitle}>{exercise.name}</Text>
+                    <Pressable onPress={() => setBuilderExercises((prev) => prev.filter((item) => item.id !== exercise.id))}>
+                      <MaterialIcons name="delete" size={22} color="#EF9A9A" />
                     </Pressable>
                   </View>
-                  <Text style={styles.loggedSetMetricLabel}>Reps</Text>
-                  <View style={styles.trainingStatActions}>
-                    <Pressable style={styles.trainingStatButton} onPress={() => setBuilderExercises((prev) => prev.map((item) => item.id === exercise.id ? { ...item, reps: Math.max(1, Math.min(50, item.reps - 1)) } : item))}>
-                      <Text style={styles.trainingStatButtonText}>-</Text>
-                    </Pressable>
-                    <Text style={styles.loggedSetMetricValue}>{exercise.reps}</Text>
-                    <Pressable style={styles.trainingStatButton} onPress={() => setBuilderExercises((prev) => prev.map((item) => item.id === exercise.id ? { ...item, reps: Math.max(1, Math.min(50, item.reps + 1)) } : item))}>
-                      <Text style={styles.trainingStatButtonText}>+</Text>
-                    </Pressable>
+                  <View style={{ paddingLeft: 12, paddingRight: 12, paddingBottom: 12, borderTopWidth: 1, borderTopColor: '#253545' }}>
+                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 6, marginBottom: 2 }}>
+                      <View style={{ minWidth: 36 }} />
+                      <Text style={[styles.loggedSetMetricLabel, { marginLeft: 32 }]}>Reps</Text>
+                    </View>
+                    {repsArr.map((repsVal, setIdx) => (
+                      <View key={setIdx} style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 6 }}>
+                        <Text style={[styles.loggedSetMetricLabel, { minWidth: 36 }]}>Set {setIdx + 1}</Text>
+                        <View style={styles.trainingStatActions}>
+                          <Pressable style={styles.trainingStatButton} onPress={() => builderUpdateSetReps(exercise.id, setIdx, -1)}>
+                            <Text style={styles.trainingStatButtonText}>-</Text>
+                          </Pressable>
+                          <Text style={styles.loggedSetMetricValue}>{repsVal}</Text>
+                          <Pressable style={styles.trainingStatButton} onPress={() => builderUpdateSetReps(exercise.id, setIdx, 1)}>
+                            <Text style={styles.trainingStatButtonText}>+</Text>
+                          </Pressable>
+                        </View>
+                      </View>
+                    ))}
+                    <View style={styles.trainingButtons}>
+                      <Button
+                        mode="outlined"
+                        disabled={repsArr.length <= 1}
+                        onPress={() => builderRemoveSet(exercise.id)}
+                      >− Set</Button>
+                      <Button mode="contained" onPress={() => builderAddSet(exercise.id)}>+ Set</Button>
+                    </View>
                   </View>
                 </View>
-              </View>
-            ))}
+              );
+            })}
           </ScrollView>
-          <View style={styles.sessionBottomActions}>
-            <Pressable style={styles.sessionNavButton} onPress={() => { setEditingPlanId(null); setView('home'); }}>
-              <MaterialIcons name="arrow-back" size={24} color="#0F1419" />
-            </Pressable>
-            <Pressable style={styles.sessionFinishButton} onPress={saveBuilderPlan}>
-              <Text style={styles.sessionFinishButtonText}>{editingPlanId ? 'Spara ändringar' : 'Spara pass'}</Text>
-            </Pressable>
-            <Pressable style={styles.sessionPlusButton} onPress={() => openLibrary('builder')}>
-              <Text style={styles.sessionPlusButtonText}>+</Text>
-            </Pressable>
-          </View>
         </View>
       ) : null}
 
       {view === 'saved' ? (
         <View style={styles.screen}>
           <View style={styles.trainingSessionTop}>
-            <Text style={styles.trainingTimer}>Mina pass</Text>
+            <View style={styles.trainingSessionTopRow}>
+              <Pressable style={styles.trainingMiniButton} onPress={goHomeWithReverseTransition}>
+                <MaterialIcons name="arrow-back" size={20} color="#DCE4EC" />
+              </Pressable>
+              <Text style={styles.trainingTimer}>Mina pass</Text>
+              <View style={styles.trainingTopActionsRight} />
+            </View>
           </View>
           <ScrollView contentContainerStyle={styles.listContent}>
             {workoutPlans.length === 0 ? <Text style={styles.loggedSetEmpty}>Inga skapade pass ännu.</Text> : null}
             {workoutPlans.map((plan) => (
-              <View key={plan.id} style={styles.trainingCard}>
+              <Pressable key={plan.id} style={styles.trainingCard} onPress={() => openPlanDetail(plan)}>
                 <Text style={styles.trainingTitle}>{plan.name}</Text>
-                <View style={styles.savedPlanActionsRow}>
-                  <Button mode="outlined" style={styles.savedPlanActionButton} onPress={() => loadPlanForEditing(plan)}>
-                    Visa/redigera pass
-                  </Button>
-                  <Button mode="contained" style={styles.savedPlanActionButton} onPress={() => startWorkoutFromPlan(plan)}>
-                    Starta pass
-                  </Button>
-                </View>
-              </View>
+                <Button mode="contained" style={styles.savedPlanStartButton} onPress={() => startWorkoutFromPlan(plan)}>
+                  Starta pass
+                </Button>
+              </Pressable>
             ))}
           </ScrollView>
-          <View style={styles.sessionBottomActions}>
-            <Pressable style={styles.sessionFinishButton} onPress={() => setView('home')}>
-              <Text style={styles.sessionFinishButtonText}>Tillbaka</Text>
-            </Pressable>
-          </View>
         </View>
       ) : null}
+
+      {view === 'planDetail' && selectedPlanId ? (() => {
+        const plan = workoutPlans.find((p) => p.id === selectedPlanId);
+        if (!plan) return null;
+        return (
+          <View style={styles.screen}>
+            <View style={styles.trainingSessionTop}>
+              <View style={styles.trainingSessionTopRow}>
+                <Pressable style={styles.trainingMiniButton} onPress={goBackToSaved}>
+                  <MaterialIcons name="arrow-back" size={20} color="#DCE4EC" />
+                </Pressable>
+                <Text style={styles.trainingTimer} numberOfLines={1} ellipsizeMode="tail">{plan.name}</Text>
+                <View style={styles.trainingTopActionsRight}>
+                  <Pressable style={styles.trainingMiniPrimaryButton} onPress={() => loadPlanForEditing(plan)}>
+                    <MaterialIcons name="edit" size={20} color="#0F1419" />
+                  </Pressable>
+                  <Pressable style={styles.trainingMiniDangerButton} onPress={() => confirmDeletePlan(plan.id, plan.name, goBackToSaved)}>
+                    <MaterialIcons name="delete-outline" size={20} color="#EF9A9A" />
+                  </Pressable>
+                </View>
+              </View>
+            </View>
+            <ScrollView contentContainerStyle={styles.listContent}>
+              {plan.exercises.length === 0 ? <Text style={styles.loggedSetEmpty}>Inga övningar i passet.</Text> : null}
+              {plan.exercises.map((exercise) => {
+                const repsArr = getRepsPerSet(exercise);
+                const repsLabel = repsArr.length === 1 ? `${repsArr[0]} reps` : `${repsArr.length} set: ${repsArr.join(', ')} reps`;
+                return (
+                  <View key={exercise.id} style={styles.trainingCard}>
+                    <Text style={styles.trainingTitle}>{exercise.name}</Text>
+                    <Text style={styles.trainingMeta}>{repsLabel}</Text>
+                  </View>
+                );
+              })}
+            </ScrollView>
+          </View>
+        );
+      })() : null}
+
+      {view === 'pbOverview' ? (
+        <View style={styles.screen}>
+          <View style={styles.trainingSessionTop}>
+            <View style={styles.trainingSessionTopRow}>
+              <Pressable style={styles.trainingMiniButton} onPress={goHomeWithReverseTransition}>
+                <MaterialIcons name="arrow-back" size={20} color="#DCE4EC" />
+              </Pressable>
+              <Text style={styles.trainingTimer}>Mina PB&apos;s</Text>
+              <View style={styles.trainingTopActionsRight} />
+            </View>
+          </View>
+          <ScrollView contentContainerStyle={styles.listContent}>
+            {pbOverviewExercises.length === 0 ? (
+              <Text style={styles.loggedSetEmpty}>Inga PB ännu. Spara ett pass med PB för att se listan här.</Text>
+            ) : null}
+            {pbOverviewExercises.map((item) => (
+              <Pressable
+                key={`pb-overview-${item.exerciseId}`}
+                style={styles.trainingCard}
+                onPress={() => openPbModalByExerciseId(item.exerciseId, item.displayName)}
+              >
+                <Text style={styles.trainingTitle}>{item.displayName}</Text>
+                <Text style={styles.trainingMeta}>
+                  Vikter: {item.rowsCount} • Högsta reps: {item.bestReps} • Tyngst vikt: {formatWeightKg(weightKeyToKg(item.highestWeightKey))} kg
+                </Text>
+              </Pressable>
+            ))}
+          </ScrollView>
+        </View>
+      ) : null}
+
+      {view === 'preloaded' ? (
+        <View style={styles.screen}>
+          <View style={styles.trainingSessionTop}>
+            <View style={styles.trainingSessionTopRow}>
+              <Pressable style={styles.trainingMiniButton} onPress={goHomeWithReverseTransition}>
+                <MaterialIcons name="arrow-back" size={20} color="#DCE4EC" />
+              </Pressable>
+              <Text style={styles.trainingTimer}>Förinlagda pass</Text>
+              <View style={styles.trainingTopActionsRight} />
+            </View>
+          </View>
+          <ScrollView contentContainerStyle={styles.listContent}>
+            <View style={styles.preloadedPlaceholderCard}>
+              <MaterialCommunityIcons name="calendar-check" size={48} color="#8FA1B3" />
+              <Text style={styles.preloadedPlaceholderTitle}>Förinlagda pass</Text>
+              <Text style={styles.preloadedPlaceholderText}>Här kommer förinlagda träningspass att finnas framöver. Du kan då välja färdiga pass och köra igång snabbt.</Text>
+            </View>
+          </ScrollView>
+        </View>
+      ) : null}
+        </Animated.View>
+        {showTransitionPreview ? (
+          <Animated.View
+            pointerEvents="none"
+            style={[
+              styles.trainingPreviewOverlay,
+              {
+                opacity: transitionPreviewFadeOpacity,
+                borderRadius: transitionCornerRadius,
+                transform: [
+                  { translateX: transitionTranslateX },
+                  { translateY: transitionTranslateY },
+                  { scaleX: transitionScaleX },
+                  { scaleY: transitionScaleY },
+                ],
+              },
+            ]}
+          />
+        ) : null}
+        <Animated.View
+          pointerEvents="none"
+          style={[styles.trainingBlurOverlay, { opacity: 0 }]}
+        >
+          <BlurView intensity={42} tint="dark" style={StyleSheet.absoluteFillObject} />
+        </Animated.View>
+      </View>
+
+      <Modal visible={!!pbModalExercise} transparent animationType="fade" onRequestClose={closePbModal}>
+        <View style={styles.timePickerBackdrop}>
+          <View style={[styles.timePickerCard, styles.pbModalCard]}>
+            <View style={styles.pbModalHeader}>
+              <Text style={styles.timePickerTitle}>
+                PB per vikt{pbModalExercise ? ` • ${pbModalExercise.name}` : ''}
+              </Text>
+              <Button compact mode="outlined" textColor="#90CAF9" onPress={cyclePbSortMode}>Sortera: {pbSortLabel}</Button>
+            </View>
+            <ScrollView style={styles.pbList}>
+              {selectedExercisePbRows.map((entry) => (
+                <View key={`${entry.exerciseId}-${entry.weightKey}`} style={styles.pbRow}>
+                  <Text style={styles.pbRowText}>{formatWeightKg(weightKeyToKg(entry.weightKey))} kg</Text>
+                  <Text style={styles.pbRowText}>{entry.bestReps} reps</Text>
+                  <Text style={styles.pbRowDate}>{new Intl.DateTimeFormat('sv-SE', { dateStyle: 'short' }).format(new Date(entry.date))}</Text>
+                </View>
+              ))}
+              {selectedExercisePbRows.length === 0 ? (
+                <Text style={styles.logEmpty}>Inga PB registrerade för övningen ännu.</Text>
+              ) : null}
+            </ScrollView>
+            <View style={styles.timePickerActions}>
+              <Button onPress={closePbModal}>Stäng</Button>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal visible={pbSummaryVisible} transparent animationType="fade" onRequestClose={() => setPbSummaryVisible(false)}>
+        <View style={styles.timePickerBackdrop}>
+          <View style={[styles.timePickerCard, styles.pbSummaryCard]}>
+            <View style={styles.pbSummaryHeaderRow}>
+              <View>
+                <Text style={styles.pbSummaryTitle}>🏆 Nya PB i passet</Text>
+                <Text style={styles.pbSummaryMeta}>{pbSummaryTotal} nya PB</Text>
+              </View>
+              <Pressable style={styles.pbSummaryCloseButton} onPress={() => setPbSummaryVisible(false)}>
+                <MaterialIcons name="close" size={20} color="#DCE4EC" />
+              </Pressable>
+            </View>
+            <ScrollView style={styles.pbSummaryList}>
+              {pbSummaryRows.map((event, idx) => (
+                <View key={`${event.exerciseName}-${event.weightKg}-${event.newBestReps}-${idx}`} style={styles.pbSummaryRow}>
+                  <Text style={styles.pbSummaryExercise}>{event.exerciseName}</Text>
+                  <Text style={styles.pbSummaryMainValue}>
+                    {formatWeightKg(event.weightKg)} kg × {event.newBestReps} reps
+                  </Text>
+                  <Text style={styles.pbSummarySubValue}>
+                    {event.oldBestReps > 0 ? `Tidigare PB: ${event.oldBestReps} reps` : 'Första PB på vikten'}
+                  </Text>
+                </View>
+              ))}
+              {pbSummaryTotal > pbSummaryRows.length ? (
+                <Text style={styles.pbSummaryMoreText}>+{pbSummaryTotal - pbSummaryRows.length} fler PB i passet</Text>
+              ) : null}
+            </ScrollView>
+            <View style={styles.timePickerActions}>
+              <Button mode="outlined" onPress={() => setPbSummaryVisible(false)}>Stäng</Button>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal visible={builderConfirmVisible} transparent animationType="fade" onRequestClose={() => setBuilderConfirmVisible(false)}>
+        <View style={styles.timePickerBackdrop}>
+          <View style={[styles.timePickerCard, styles.builderConfirmCard]}>
+            <Text style={styles.timePickerTitle}>
+              {editingPlanId ? 'Vill du spara ändringarna i passet?' : 'Vill du skapa detta pass?'}
+            </Text>
+            <View style={styles.builderConfirmSummary}>
+              <Text style={styles.builderConfirmPlanName}>
+                {builderName.trim() || 'Namnlöst pass'}
+              </Text>
+              {builderExercises.map((exercise) => {
+                const repsArr = getRepsPerSet(exercise);
+                const repsLabel = repsArr.length === 1
+                  ? `${repsArr[0]} reps`
+                  : `${repsArr.length} set: ${repsArr.join(', ')} reps`;
+                return (
+                  <Text key={exercise.id} style={styles.builderConfirmExerciseRow}>
+                    • {exercise.name} — {repsLabel}
+                  </Text>
+                );
+              })}
+            </View>
+            <View style={styles.timePickerActions}>
+              <Button mode="outlined" textColor="#DCE4EC" onPress={() => setBuilderConfirmVisible(false)}>
+                Tillbaka
+              </Button>
+              <Button mode="contained" onPress={saveBuilderPlan}>Spara</Button>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal visible={sessionConfirmVisible} transparent animationType="fade" onRequestClose={() => setSessionConfirmVisible(false)}>
+        <View style={styles.timePickerBackdrop}>
+          <View style={[styles.timePickerCard, styles.builderConfirmCard]}>
+            <Text style={styles.timePickerTitle}>Vill du avsluta och spara passet?</Text>
+            <View style={styles.builderConfirmSummary}>
+              <Text style={styles.builderConfirmPlanName}>
+                {sessionSourcePlanName || `Pass ${formatDuration(elapsedSeconds)}`}
+              </Text>
+              {sessionExercises.map((exercise) => {
+                const setsWithWeight = exercise.sets.filter((s) => s.reps > 0);
+                const setsLabel = setsWithWeight.length === 0
+                  ? 'Inga set'
+                  : `${setsWithWeight.length} set`;
+                return (
+                  <Text key={exercise.id} style={styles.builderConfirmExerciseRow}>
+                    • {exercise.name} — {setsLabel}
+                  </Text>
+                );
+              })}
+            </View>
+            <View style={styles.timePickerActions}>
+              <Button mode="outlined" textColor="#DCE4EC" onPress={() => setSessionConfirmVisible(false)}>
+                Tillbaka
+              </Button>
+              <Button mode="contained" onPress={() => { setSessionConfirmVisible(false); commitCompletedWorkout(); }}>
+                Spara pass
+              </Button>
+            </View>
+          </View>
+        </View>
+      </Modal>
 
       <Modal visible={gymLibraryVisible} transparent animationType="none" onRequestClose={closeGymLibrary}>
         <View style={styles.bottomSheetBackdrop}>
@@ -1206,29 +2480,81 @@ function TrainingScreen({
                 placeholder="Sök gymövning"
                 placeholderTextColor={PLACEHOLDER_COLOR}
               />
-              <ScrollView
+              <RNScrollView
                 horizontal
                 showsHorizontalScrollIndicator={false}
                 style={styles.filterRow}
                 contentContainerStyle={styles.filterRowContent}
               >
+                <Pressable
+                  key="gym-body-all"
+                  style={[
+                    styles.chip,
+                    styles.gymFilterChipSmall,
+                    gymLibraryFilter === null && styles.chipActive,
+                    gymLibraryFilter === null && styles.gymFilterChipActive,
+                  ]}
+                  onPress={() => setGymLibraryFilter(null)}
+                >
+                  <Text style={[styles.chipText, styles.gymFilterChipTextSmall, gymLibraryFilter === null && styles.chipTextActive]}>Alla</Text>
+                </Pressable>
                 {gymBodyPartFilters.map((tag) => {
                   const active = gymLibraryFilter === tag;
                   return (
                     <Pressable
-                      key={`gym-filter-${tag}`}
-                      style={[styles.chip, styles.gymFilterChip, active && styles.chipActive, active && styles.gymFilterChipActive]}
+                      key={`gym-body-${tag}`}
+                      style={[styles.chip, styles.gymFilterChipSmall, active && styles.chipActive, active && styles.gymFilterChipActive]}
                       onPress={() =>
                         setGymLibraryFilter((prev) => (prev === tag ? null : tag))
                       }
                     >
-                      <Text style={[styles.chipText, styles.gymFilterChipText, active && styles.chipTextActive]}>{tag}</Text>
+                      <Text style={[styles.chipText, styles.gymFilterChipTextSmall, active && styles.chipTextActive]}>{tag}</Text>
                     </Pressable>
                   );
                 })}
-              </ScrollView>
-              <ScrollView nestedScrollEnabled keyboardShouldPersistTaps="handled" bounces={false} overScrollMode="never" contentContainerStyle={styles.libraryList}>
-                {gymLibraryQuery.trim().length > 0 && !hasExactGymMatch ? (
+              </RNScrollView>
+              <RNScrollView
+                horizontal
+                showsHorizontalScrollIndicator={false}
+                style={[styles.filterRow, styles.filterRowSecond]}
+                contentContainerStyle={styles.filterRowContentSecond}
+              >
+                <Pressable
+                  key="gym-equipment-all"
+                  style={[
+                    styles.chip,
+                    styles.gymFilterChipSmall,
+                    gymLibraryEquipmentFilter === null && styles.chipActive,
+                    gymLibraryEquipmentFilter === null && styles.gymFilterChipActive,
+                  ]}
+                  onPress={() => setGymLibraryEquipmentFilter(null)}
+                >
+                  <Text style={[styles.chipText, styles.gymFilterChipTextSmall, gymLibraryEquipmentFilter === null && styles.chipTextActive]}>Alla</Text>
+                </Pressable>
+                {GYM_EQUIPMENT_TAGS.map((tag) => {
+                  const active = gymLibraryEquipmentFilter === tag;
+                  return (
+                    <Pressable
+                      key={`gym-equipment-${tag}`}
+                      style={[styles.chip, styles.gymFilterChipSmall, active && styles.chipActive, active && styles.gymFilterChipActive]}
+                      onPress={() =>
+                        setGymLibraryEquipmentFilter((prev) => (prev === tag ? null : tag))
+                      }
+                    >
+                      <Text style={[styles.chipText, styles.gymFilterChipTextSmall, active && styles.chipTextActive]}>{tag}</Text>
+                    </Pressable>
+                  );
+                })}
+              </RNScrollView>
+              <FlatList
+                style={styles.libraryListScroll}
+                data={filteredGymLibrary}
+                keyExtractor={(exercise) => `gym-lib-${exercise.id}`}
+                keyboardShouldPersistTaps="handled"
+                bounces={false}
+                overScrollMode="never"
+                contentContainerStyle={styles.libraryList}
+                ListHeaderComponent={gymLibraryQuery.trim().length > 0 && !hasExactGymMatch ? (
                   <View style={styles.libraryItem}>
                     <View style={styles.libraryItemMain}>
                       <Text style={styles.libraryName}>Vill du lägga till "{gymLibraryQuery.trim()}"?</Text>
@@ -1238,13 +2564,14 @@ function TrainingScreen({
                         </View>
                       </View>
                     </View>
-                    <Button mode="contained-tonal" onPress={addCustomGymExercise}>
+                    <Button mode="contained" onPress={addCustomGymExercise} contentStyle={styles.libraryItemButton} labelStyle={{ fontSize: 11 }}>
                       Lägg till
                     </Button>
                   </View>
                 ) : null}
-                {filteredGymLibrary.map((exercise) => (
-                  <View key={`gym-lib-${exercise.id}`} style={styles.libraryItem}>
+                ListEmptyComponent={<Text style={styles.logEmpty}>Inga övningar matchar filtret.</Text>}
+                renderItem={({ item: exercise }) => (
+                  <View style={styles.libraryItem}>
                     <View style={styles.libraryItemMain}>
                       <Text style={styles.libraryName}>{exercise.name}</Text>
                       <View style={styles.libraryTagWrap}>
@@ -1255,13 +2582,12 @@ function TrainingScreen({
                         ))}
                       </View>
                     </View>
-                    <Button mode="contained-tonal" onPress={() => addLibraryExercise(exercise)}>
+                    <Button mode="contained" onPress={() => addLibraryExercise(exercise)} contentStyle={styles.libraryItemButton} labelStyle={{ fontSize: 11 }}>
                       Välj
                     </Button>
                   </View>
-                ))}
-                {filteredGymLibrary.length === 0 ? <Text style={styles.logEmpty}>Inga övningar matchar filtret.</Text> : null}
-              </ScrollView>
+                )}
+              />
             </View>
           </Animated.View>
           {gymCategoryEditorVisible && (
@@ -1277,27 +2603,61 @@ function TrainingScreen({
                     placeholder="Egen kategori"
                     placeholderTextColor={PLACEHOLDER_COLOR}
                   />
-                  <Button mode="contained-tonal" onPress={addGymCustomCategory}>
+                  <Button mode="contained" onPress={addGymCustomCategory}>
                     Lägg till
                   </Button>
                 </View>
-                <Text style={styles.categoryHintText}>Välj en eller flera kategorier</Text>
                 <ScrollView style={styles.categoryDialogList} contentContainerStyle={styles.categoryChipListContent}>
-                  <View style={styles.chipWrap}>
-                    {gymCategoryChoices.map((tag) => (
-                      <Pressable
-                        key={`gym-category-${tag}`}
-                        style={[styles.chip, gymCategoryDraftTags.includes(tag) && styles.chipActive]}
-                        onPress={() => toggleGymCategoryDraft(tag)}
-                      >
-                        <Text style={[styles.chipText, gymCategoryDraftTags.includes(tag) && styles.chipTextActive]}>{tag}</Text>
-                      </Pressable>
-                    ))}
+                  <Text style={styles.categorySectionLabel}>Muskelgrupp</Text>
+                  <View style={styles.categoryChipSection}>
+                    <View style={styles.chipWrap}>
+                      {gymBodyPartFilters.map((tag) => (
+                        <Pressable
+                          key={`gym-body-${tag}`}
+                          style={[styles.chip, gymCategoryDraftTags.includes(tag) && styles.chipActive]}
+                          onPress={() => toggleGymCategoryDraft(tag)}
+                        >
+                          <Text style={[styles.chipText, gymCategoryDraftTags.includes(tag) && styles.chipTextActive]}>{tag}</Text>
+                        </Pressable>
+                      ))}
+                    </View>
                   </View>
+                  <Text style={styles.categorySectionLabel}>Utrustning</Text>
+                  <View style={styles.categoryChipSection}>
+                    <View style={styles.chipWrap}>
+                      {GYM_EQUIPMENT_TAGS.map((tag) => (
+                        <Pressable
+                          key={`gym-equip-${tag}`}
+                          style={[styles.chip, gymCategoryDraftTags.includes(tag) && styles.chipActive]}
+                          onPress={() => toggleGymCategoryDraft(tag)}
+                        >
+                          <Text style={[styles.chipText, gymCategoryDraftTags.includes(tag) && styles.chipTextActive]}>{tag}</Text>
+                        </Pressable>
+                      ))}
+                    </View>
+                  </View>
+                  {gymOtherDraftTags.length > 0 ? (
+                    <>
+                      <Text style={styles.categorySectionLabel}>Övrigt</Text>
+                      <View style={styles.categoryChipSection}>
+                        <View style={styles.chipWrap}>
+                          {gymOtherDraftTags.map((tag) => (
+                            <Pressable
+                              key={`gym-other-${tag}`}
+                              style={[styles.chip, styles.chipActive]}
+                              onPress={() => toggleGymCategoryDraft(tag)}
+                            >
+                              <Text style={[styles.chipText, styles.chipTextActive]}>{tag}</Text>
+                            </Pressable>
+                          ))}
+                        </View>
+                      </View>
+                    </>
+                  ) : null}
                 </ScrollView>
                 <View style={styles.timePickerActions}>
                   <Button onPress={closeGymCategoryEditor}>Avbryt</Button>
-                  <Button onPress={saveGymCategoryEditor}>Spara</Button>
+                  <Button mode="contained" onPress={saveGymCategoryEditor}>Spara</Button>
                 </View>
               </View>
             </View>
@@ -1316,6 +2676,8 @@ function AnalysisScreen({
   logs: ExerciseLog[];
 }) {
   const insets = useSafeAreaInsets();
+  const chartTopPadding = 12;
+  const chartBottomPadding = 36;
   const days = useMemo(() => buildTimelineDays(), []);
   const [menuOpen, setMenuOpen] = useState(false);
   const [selected, setSelected] = useState<string[]>(exercises.map((exercise) => exercise.id));
@@ -1343,11 +2705,24 @@ function AnalysisScreen({
 
   const chartHeight = 240;
   const selectedExercises = exercises.filter((exercise) => selected.includes(exercise.id));
+  const dailyTargetByExerciseId = useMemo(
+    () =>
+      new Map(
+        selectedExercises.map((exercise) => [
+          exercise.id,
+          {
+            baseTarget: Math.max(1, exercise.times.length || 0),
+            activeDays: new Set(parseDaysLabelToJsDays(exercise.daysLabel)),
+          },
+        ]),
+      ),
+    [selectedExercises],
+  );
   const dayCounts = useMemo(() => {
     const map = new Map<string, Record<string, number>>();
-    days.forEach((day) => map.set(formatDateKey(day), {}));
+    days.forEach((day) => map.set(formatDateKeyLocal(day), {}));
     logs.forEach((log) => {
-      const key = log.atIso.slice(0, 10);
+      const key = formatDateKeyLocal(new Date(log.atIso));
       const perExercise = map.get(key);
       if (!perExercise) return;
       perExercise[log.exerciseId] = (perExercise[log.exerciseId] || 0) + 1;
@@ -1356,15 +2731,16 @@ function AnalysisScreen({
   }, [days, logs]);
   const maxValue = Math.max(
     1,
-    ...selectedExercises.map((exercise) => exercise.sets),
-    ...days.flatMap((day) => selectedExercises.map((exercise) => dayCounts.get(formatDateKey(day))?.[exercise.id] || 0)),
+    ...selectedExercises.map((exercise) => dailyTargetByExerciseId.get(exercise.id)?.baseTarget || 1),
   );
+  const drawableChartHeight = chartHeight - chartTopPadding - chartBottomPadding;
+  const segmentGap = 2;
 
   return (
     <View style={[styles.screen, { paddingTop: insets.top }]}>
       <Text style={styles.screenTitleSmall}>Analys</Text>
       <View style={styles.dropdownRow}>
-        <Button mode="outlined" icon="filter-variant" onPress={() => setMenuOpen(true)}>
+        <Button mode="outlined" textColor="#90CAF9" icon="filter-variant" onPress={() => setMenuOpen(true)}>
           Välj övningar
         </Button>
         <Text style={styles.dropdownHint}>{selectedExercises.length} valda</Text>
@@ -1414,7 +2790,7 @@ function AnalysisScreen({
                 const isWeekend = day.getDay() === 0 || day.getDay() === 6;
                 const isMonday = day.getDay() === 1;
                 return (
-                  <React.Fragment key={formatDateKey(day)}>
+                  <React.Fragment key={formatDateKeyLocal(day)}>
                     {isWeekend ? (
                       <Rect x={index * DAY_WIDTH} y={0} width={DAY_WIDTH} height={chartHeight - 30} fill="#131B24" />
                     ) : null}
@@ -1426,19 +2802,30 @@ function AnalysisScreen({
               })}
 
               {days.map((day, index) => {
-                const counts = dayCounts.get(formatDateKey(day)) || {};
+                const counts = dayCounts.get(formatDateKeyLocal(day)) || {};
                 const bars = selectedExercises.length || 1;
                 const w = (DAY_WIDTH - 12) / bars;
                 return selectedExercises.map((exercise, barIndex) => {
                   const value = counts[exercise.id] || 0;
-                  const h = (value / maxValue) * (chartHeight - 62);
-                  const y = chartHeight - 36 - h;
                   const x = index * DAY_WIDTH + 6 + barIndex * w;
-                  const targetY = chartHeight - 36 - (exercise.sets / maxValue) * (chartHeight - 62);
+                  const barWidth = Math.max(4, w - 2);
+                  const targetInfo = dailyTargetByExerciseId.get(exercise.id);
+                  const isActiveDay = !!targetInfo && targetInfo.activeDays.has(day.getDay());
+                  const targetValue = isActiveDay ? targetInfo?.baseTarget || 1 : 0;
+                  const targetY = chartHeight - chartBottomPadding - (targetValue / maxValue) * drawableChartHeight;
+                  const unitHeight = drawableChartHeight / maxValue;
+                  const segmentHeight = Math.max(2, unitHeight - segmentGap);
+                  const segmentCount = Math.max(0, Math.floor(value));
                   return (
-                    <React.Fragment key={`${exercise.id}-${formatDateKey(day)}`}>
-                      <Rect x={x} y={y} width={Math.max(3, w - 2)} height={h} fill={exercise.color} rx={2} />
-                      <Line x1={x} y1={targetY} x2={x + Math.max(3, w - 2)} y2={targetY} stroke={exercise.color} strokeWidth={1.6} />
+                    <React.Fragment key={`${exercise.id}-${formatDateKeyLocal(day)}`}>
+                      {Array.from({ length: segmentCount }).map((_, segmentIndex) => {
+                        const segmentBottomY = chartHeight - chartBottomPadding - segmentIndex * unitHeight;
+                        const y = segmentBottomY - segmentHeight;
+                        return <Rect key={`${exercise.id}-${formatDateKeyLocal(day)}-seg-${segmentIndex}`} x={x} y={y} width={barWidth} height={segmentHeight} fill={exercise.color} rx={2} />;
+                      })}
+                      {targetValue > 0 ? (
+                        <Line x1={x} y1={targetY} x2={x + barWidth} y2={targetY} stroke={exercise.color} strokeWidth={1.6} />
+                      ) : null}
                     </React.Fragment>
                   );
                 });
@@ -1448,20 +2835,18 @@ function AnalysisScreen({
               {days.map((day, index) => {
                 const isToday = index === 60;
                 return (
-                  <View key={`${formatDateKey(day)}-axis`} style={styles.axisDay}>
+                  <View key={`${formatDateKeyLocal(day)}-axis`} style={styles.axisDay}>
                     <Text style={styles.axisWeek}>{swedishWeekday(day)}</Text>
-                    <Text style={[styles.axisDate, isToday && styles.todayText]}>
-                      {shortDate(day)}
-                      {isToday ? ' Idag' : ''}
-                    </Text>
+                    <Text style={styles.axisDate}>{shortDate(day)}</Text>
+                    <Text style={[styles.axisIdag, isToday && styles.todayText]}>{isToday ? 'Idag' : ''}</Text>
                   </View>
                 );
               })}
             </View>
+            <Text style={styles.chartHelpText}>Varje segment i stapeln = 1 registrering. Linjen visar dagens mål.</Text>
           </View>
         </ScrollView>
       </View>
-      <FAB icon="plus" color="#000" style={[styles.fab, { backgroundColor: '#90CAF9' }]} />
     </View>
   );
 }
@@ -1488,97 +2873,95 @@ function SmoothSlider({
   max?: number;
   step?: number;
 }) {
-  const anim = useRef(new Animated.Value(0)).current;
-  const thumbOffset = useMemo(() => Animated.subtract(anim, new Animated.Value(THUMB_R)), [anim]);
+  const fillAnim = useRef(new Animated.Value(0)).current;
+  const thumbAnim = useRef(new Animated.Value(-THUMB_R)).current;
   const trackRef = useRef<View>(null);
-  const state = useRef({ w: 0, px: 0, dragging: false, val: value });
-  const cb = useRef({ onValueChange, onSlidingStart, onSlidingEnd });
-  cb.current = { onValueChange, onSlidingStart, onSlidingEnd };
+  const stateRef = useRef({ w: 0, px: 0, dragging: false, val: value });
+  const cbRef = useRef({ onValueChange, onSlidingStart, onSlidingEnd });
+  cbRef.current = { onValueChange, onSlidingStart, onSlidingEnd };
 
-  const v2p = (v: number) => ((v - min) / (max - min)) * state.current.w;
-  const p2v = (px: number) => {
-    const f = Math.max(0, Math.min(1, px / (state.current.w || 1)));
-    return Math.max(min, Math.min(max, Math.round((min + f * (max - min)) / step) * step));
-  };
+  const range = max - min;
+
+  const setPosition = useCallback((pixels: number) => {
+    const safePx = Number.isFinite(pixels) ? Math.max(0, Math.min(stateRef.current.w, pixels)) : 0;
+    fillAnim.setValue(safePx);
+    thumbAnim.setValue(safePx - THUMB_R);
+  }, [fillAnim, thumbAnim]);
+
+  const v2p = useCallback((v: number) =>
+    range <= 0 ? 0 : ((v - min) / range) * Math.max(0, stateRef.current.w),
+  [min, range]);
+
+  const p2v = useCallback((px: number) => {
+    const w = stateRef.current.w || 1;
+    const f = Math.max(0, Math.min(1, px / w));
+    return Math.max(min, Math.min(max, Math.round((min + f * range) / step) * step));
+  }, [min, max, range, step]);
+
+  const apply = useCallback((absoluteX: number) => {
+    const v = p2v(absoluteX - stateRef.current.px);
+    setPosition(v2p(v));
+    if (v !== stateRef.current.val) {
+      stateRef.current.val = v;
+      cbRef.current.onValueChange(v);
+    }
+  }, [p2v, v2p, setPosition]);
 
   useEffect(() => {
-    if (!state.current.dragging) {
-      anim.setValue(v2p(value));
-      state.current.val = value;
+    if (!stateRef.current.dragging) {
+      stateRef.current.val = value;
+      setPosition(v2p(value));
     }
-  }, [value]);
+  }, [value, v2p, setPosition]);
 
-  const measure = () => {
+  const measureTrack = useCallback(() => {
     trackRef.current?.measureInWindow((px, _py, w) => {
-      state.current.px = px;
-      state.current.w = w;
-      if (!state.current.dragging) anim.setValue(v2p(state.current.val));
+      if (!Number.isFinite(px) || !Number.isFinite(w)) return;
+      stateRef.current.px = px;
+      stateRef.current.w = Math.max(0, w);
+      if (!stateRef.current.dragging) setPosition(v2p(stateRef.current.val));
     });
-  };
+  }, [v2p, setPosition]);
 
-  const apply = (pageX: number) => {
-    const v = p2v(pageX - state.current.px);
-    anim.setValue(v2p(v));
-    if (v !== state.current.val) {
-      state.current.val = v;
-      cb.current.onValueChange(v);
-    }
-  };
+  const panGesture = useMemo(
+    () =>
+      Gesture.Pan()
+        .minDistance(0)
+        .onBegin((e) => {
+          stateRef.current.dragging = true;
+          cbRef.current.onSlidingStart?.();
+          apply(e.absoluteX);
+        })
+        .onUpdate((e) => {
+          apply(e.absoluteX);
+        })
+        .onEnd(() => {
+          stateRef.current.dragging = false;
+          cbRef.current.onSlidingEnd?.();
+        })
+        .onFinalize(() => {
+          if (stateRef.current.dragging) {
+            stateRef.current.dragging = false;
+            cbRef.current.onSlidingEnd?.();
+          }
+        }),
+    [apply],
+  );
 
-  const pan = useRef(
-    PanResponder.create({
-      onStartShouldSetPanResponder: () => true,
-      onMoveShouldSetPanResponder: () => true,
-      onStartShouldSetPanResponderCapture: () => true,
-      onMoveShouldSetPanResponderCapture: () => true,
-      onPanResponderTerminationRequest: () => false,
-      onPanResponderGrant(e) {
-        state.current.dragging = true;
-        cb.current.onSlidingStart?.();
-        trackRef.current?.measureInWindow((px, _py, w) => {
-          state.current.px = px;
-          state.current.w = w;
-          apply(e.nativeEvent.pageX);
-        });
-      },
-      onPanResponderMove(e) {
-        apply(e.nativeEvent.pageX);
-      },
-      onPanResponderRelease() {
-        state.current.dragging = false;
-        cb.current.onSlidingEnd?.();
-      },
-      onPanResponderTerminate() {
-        state.current.dragging = false;
-        cb.current.onSlidingEnd?.();
-      },
-    }),
-  ).current;
-
-  const steps = (max - min) / step;
+  const steps = range <= 0 || step <= 0 ? 1 : Math.max(1, Math.floor(range / step));
+  const valueRatio = range <= 0 ? 0 : (value - min) / range;
 
   return (
-    <View style={{ height: SLIDER_HIT, justifyContent: 'center' }}>
-      <View ref={trackRef} onLayout={measure} {...pan.panHandlers} style={{ height: SLIDER_HIT, justifyContent: 'center' }}>
+    <GestureDetector gesture={panGesture}>
+      <View ref={trackRef} onLayout={measureTrack} style={{ height: SLIDER_HIT, justifyContent: 'center' }}>
         {/* Track background */}
-        <View
-          style={{
-            height: TRACK_H,
-            borderRadius: TRACK_H / 2,
-            backgroundColor: '#2C3A49',
-          }}
-        />
+        <View style={{ height: TRACK_H, borderRadius: TRACK_H / 2, backgroundColor: '#2C3A49' }} />
         {/* Step dots */}
         <View style={{ position: 'absolute', left: 0, right: 0, flexDirection: 'row', justifyContent: 'space-between', top: (SLIDER_HIT - 4) / 2 }}>
           {Array.from({ length: steps + 1 }, (_, i) => (
             <View
               key={i}
-              style={{
-                width: 4,
-                height: 4,
-                borderRadius: 2,
-                backgroundColor: i / steps <= (value - min) / (max - min) ? '#7BA4CC' : '#3D4F5F',
-              }}
+              style={{ width: 4, height: 4, borderRadius: 2, backgroundColor: i / steps <= valueRatio ? '#7BA4CC' : '#3D4F5F' }}
             />
           ))}
         </View>
@@ -1591,7 +2974,7 @@ function SmoothSlider({
             height: TRACK_H,
             borderRadius: TRACK_H / 2,
             backgroundColor: '#5E81AC',
-            width: anim,
+            width: fillAnim,
           }}
         />
         {/* Thumb */}
@@ -1605,31 +2988,24 @@ function SmoothSlider({
             borderWidth: 2.5,
             borderColor: '#5E81AC',
             top: (SLIDER_HIT - THUMB_R * 2) / 2,
-            transform: [{ translateX: thumbOffset }],
+            transform: [{ translateX: thumbAnim }],
             ...Platform.select({
-              ios: {
-                shadowColor: '#000',
-                shadowOffset: { width: 0, height: 2 },
-                shadowOpacity: 0.18,
-                shadowRadius: 4,
-              },
+              ios: { shadowColor: '#000', shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.18, shadowRadius: 4 },
               android: { elevation: 4 },
             }),
           }}
         />
       </View>
-    </View>
+    </GestureDetector>
   );
 }
 
 function DiaryScreen({
   series,
   setSeries,
-  onAddSeries,
 }: {
   series: PainSeries[];
   setSeries: React.Dispatch<React.SetStateAction<PainSeries[]>>;
-  onAddSeries: () => void;
 }) {
   const insets = useSafeAreaInsets();
   const [activeSeriesId, setActiveSeriesId] = useState<string | null>(series[0]?.id ?? null);
@@ -1640,7 +3016,7 @@ function DiaryScreen({
   const [visibleRange, setVisibleRange] = useState<[number, number]>([0, 0]);
   const [scrollLocked, setScrollLocked] = useState(false);
   const chartScrollRef = useRef<ScrollView>(null);
-  const diaryScrollRef = useRef<ScrollView>(null);
+  const diaryScrollRef = useRef<RNScrollView>(null);
   const logRowYById = useRef<Record<string, number>>({});
   const logRowHeightById = useRef<Record<string, number>>({});
   const logWrapY = useRef(0);
@@ -1648,17 +3024,21 @@ function DiaryScreen({
   const diaryScrollY = useRef(0);
   const chartTouchStart = useRef<{ x: number; y: number } | null>(null);
   const chartTouchMoved = useRef(false);
+  const prevPointsLengthRef = useRef(0);
 
   useEffect(() => {
     if (!activeSeriesId && series[0]) setActiveSeriesId(series[0].id);
   }, [activeSeriesId, series]);
 
   const active = series.find((item) => item.id === activeSeriesId) || series[0];
+  // Sortera äldst först så att nyaste punkt hamnar längst till höger
   const allPoints = useMemo(() => {
     if (!active) return [];
+    const nowMs = Date.now();
     return active.entries
       .map((entry) => {
         const day = new Date(entry.atIso);
+        if (Number.isNaN(day.getTime()) || day.getTime() > nowMs) return null;
         const y = 14 + ((10 - entry.value) / 9) * 186;
         return { day, y, entry };
       })
@@ -1670,22 +3050,21 @@ function DiaryScreen({
     [allPoints],
   );
   const chartWidth = Math.max(viewportWidth, CHART_SIDE_PADDING * 2 + Math.max(points.length - 1, 0) * ENTRY_SPACING);
-  const latestTime = allPoints.length > 0 ? new Date(allPoints[allPoints.length - 1].entry.atIso).getTime() : Date.now();
-  const viewStartTime = latestTime - DIARY_VIEW_CONFIG[viewMode].spanMs;
 
+  // Scrolla så att högerkanten (nyaste datum) visas – äldsta vänster, nyaste höger
+  const didAddPoint = points.length > prevPointsLengthRef.current;
+  if (didAddPoint) prevPointsLengthRef.current = points.length;
   useEffect(() => {
+    const x = Math.max(0, chartWidth - viewportWidth);
     const id = setTimeout(() => {
-      const startIndex = points.findIndex((point) => new Date(point.entry.atIso).getTime() >= viewStartTime);
-      const startX = startIndex >= 0 ? points[startIndex].x - CHART_SIDE_PADDING : chartWidth - viewportWidth;
-      const x = Math.max(Math.min(startX, chartWidth - viewportWidth), 0);
-      chartScrollRef.current?.scrollTo({ x, animated: false });
+      chartScrollRef.current?.scrollTo({ x, animated: didAddPoint });
       setVisibleRange([x, x + viewportWidth]);
       if (points.length > 0) {
         setMonth(monthTitle(points[points.length - 1].day));
       }
-    }, 80);
+    }, didAddPoint ? 120 : 80);
     return () => clearTimeout(id);
-  }, [viewportWidth, chartWidth, points, viewMode, viewStartTime]);
+  }, [viewportWidth, chartWidth, points, didAddPoint]);
 
   const curve = createCurvePath(points.map((point) => ({ x: point.x, y: point.y })));
   const visibleEntries = points
@@ -1721,7 +3100,7 @@ function DiaryScreen({
   return (
     <View style={[styles.screen, { paddingTop: insets.top }]}>
       <Text style={styles.screenTitleSmall}>Dagbok</Text>
-      <ScrollView
+      <RNScrollView
         ref={diaryScrollRef}
         contentContainerStyle={styles.listContent}
         scrollEnabled={!scrollLocked}
@@ -1732,20 +3111,21 @@ function DiaryScreen({
         scrollEventThrottle={16}
       >
         {series.map((item) => (
-          <Pressable
+          <View
             key={item.id}
-            onTouchStart={() => setActiveSeriesId(item.id)}
             style={[styles.seriesCard, active?.id === item.id && styles.activeSeriesCard]}
           >
-            <View style={styles.seriesHeader}>
-              <Text style={styles.seriesTitle}>{item.name}</Text>
-              <Pressable onPress={() => setSeries((prev) => prev.filter((s) => s.id !== item.id))}>
-                <MaterialIcons name="delete" size={24} color="#EF9A9A" />
-              </Pressable>
-            </View>
-            <View style={styles.badge}>
-              <Text style={styles.badgeText}>{item.value}</Text>
-            </View>
+            <Pressable onPress={() => setActiveSeriesId(item.id)}>
+              <View style={styles.seriesHeader}>
+                <Text style={styles.seriesTitle}>{item.name}</Text>
+                <Pressable onPress={() => setSeries((prev) => prev.filter((s) => s.id !== item.id))}>
+                  <MaterialIcons name="delete" size={24} color="#EF9A9A" />
+                </Pressable>
+              </View>
+              <View style={styles.badge}>
+                <Text style={styles.badgeText}>{item.value}</Text>
+              </View>
+            </Pressable>
             <SmoothSlider
               min={1}
               max={10}
@@ -1754,18 +3134,19 @@ function DiaryScreen({
               onValueChange={(v) =>
                 setSeries((prev) => prev.map((s) => (s.id === item.id ? { ...s, value: v } : s)))
               }
-              onSlidingStart={() => setScrollLocked(true)}
+              onSlidingStart={() => { setActiveSeriesId(item.id); setScrollLocked(true); }}
               onSlidingEnd={() => setScrollLocked(false)}
             />
             <TextInput
               value={item.draftNote}
               onChangeText={(text) => setSeries((prev) => prev.map((s) => (s.id === item.id ? { ...s, draftNote: text } : s)))}
+              onFocus={() => setActiveSeriesId(item.id)}
               style={[styles.input, styles.noteInput]}
               placeholder="Hur mår du just nu?"
               placeholderTextColor={PLACEHOLDER_COLOR}
               multiline
             />
-            <View style={styles.seriesButtons}>
+            <Pressable style={styles.seriesButtons} onPress={() => setActiveSeriesId(item.id)}>
               <Button
                 mode="contained"
                 onPress={() =>
@@ -1798,8 +3179,8 @@ function DiaryScreen({
               >
                 Ångra
               </Button>
-            </View>
-          </Pressable>
+            </Pressable>
+          </View>
         ))}
 
         <View style={styles.diaryChartHeader}>
@@ -1808,6 +3189,7 @@ function DiaryScreen({
             <Button
               mode="outlined"
               compact
+              textColor="#90CAF9"
               onPress={() => {
                 setViewMode((prev) => DIARY_VIEW_ORDER[(DIARY_VIEW_ORDER.indexOf(prev) + 1) % DIARY_VIEW_ORDER.length]);
               }}
@@ -1937,13 +3319,134 @@ function DiaryScreen({
             </Pressable>
           ))}
         </Pressable>
-      </ScrollView>
-      <FAB icon="plus" color="#000" style={[styles.fab, { backgroundColor: '#FFE082' }]} onPress={onAddSeries} />
+      </RNScrollView>
+    </View>
+  );
+}
+
+const TAB_PILL_WIDTH = 52;
+const TAB_PILL_HEIGHT = 52;
+const TAB_BAR_PADDING_H = 14;
+
+function FloatingTabBar({
+  state,
+  navigation,
+  hasActiveWorkout,
+}: {
+  state: { index: number; routes: { key: string; name: string }[] };
+  navigation: { emit: (opts: { type: 'tabPress'; target: string; canPreventDefault: true }) => { defaultPrevented: boolean }; navigate: (name: string) => void };
+  hasActiveWorkout: boolean;
+}) {
+  const [tabBarWidth, setTabBarWidth] = useState(0);
+  const pillTranslateX = useRef(new Animated.Value(0)).current;
+  const prevIndexRef = useRef(state.index);
+  const workoutPulseAnim = useRef(new Animated.Value(0)).current;
+
+  useEffect(() => {
+    if (!hasActiveWorkout) {
+      workoutPulseAnim.setValue(0);
+      return;
+    }
+    const loop = Animated.loop(
+      Animated.sequence([
+        Animated.timing(workoutPulseAnim, { toValue: 1, duration: 900, easing: Easing.inOut(Easing.ease), useNativeDriver: true }),
+        Animated.timing(workoutPulseAnim, { toValue: 0.15, duration: 900, easing: Easing.inOut(Easing.ease), useNativeDriver: true }),
+      ]),
+    );
+    loop.start();
+    return () => loop.stop();
+  }, [hasActiveWorkout, workoutPulseAnim]);
+
+  const getPillTranslateX = useCallback((index: number) => {
+    if (tabBarWidth <= 0) return 0;
+    const contentWidth = tabBarWidth - TAB_BAR_PADDING_H * 2;
+    const tabWidth = contentWidth / state.routes.length;
+    const centerX = TAB_BAR_PADDING_H + tabWidth * (index + 0.5);
+    return centerX - TAB_PILL_WIDTH / 2;
+  }, [tabBarWidth, state.routes.length]);
+
+  useEffect(() => {
+    if (tabBarWidth <= 0) return;
+    const targetX = getPillTranslateX(state.index);
+    if (prevIndexRef.current === state.index) {
+      pillTranslateX.setValue(targetX);
+    } else {
+      prevIndexRef.current = state.index;
+      Animated.spring(pillTranslateX, {
+        toValue: targetX,
+        useNativeDriver: true,
+        damping: 25,
+        stiffness: 400,
+      }).start();
+    }
+  }, [state.index, tabBarWidth, getPillTranslateX, pillTranslateX]);
+
+  const handleLayout = useCallback((e: { nativeEvent: { layout: { width: number } } }) => {
+    const w = e.nativeEvent.layout.width;
+    if (w > 0 && tabBarWidth !== w) {
+      setTabBarWidth(w);
+      const initialX = TAB_BAR_PADDING_H + (w - TAB_BAR_PADDING_H * 2) / state.routes.length * (state.index + 0.5) - TAB_PILL_WIDTH / 2;
+      pillTranslateX.setValue(initialX);
+    }
+  }, [state.index, state.routes.length, tabBarWidth, pillTranslateX]);
+
+  return (
+    <View style={styles.floatingTabBarOuter} pointerEvents="box-none">
+      <View style={styles.floatingTabBar} onLayout={handleLayout}>
+        <Animated.View
+          style={[
+            styles.floatingTabPillSliding,
+            { transform: [{ translateX: pillTranslateX }] },
+          ]}
+          pointerEvents="none"
+        />
+        {state.routes.map((route, index) => {
+          const isFocused = state.index === index;
+          const iconColor = isFocused ? '#1A222C' : '#90A4B8';
+          const IconComponent = route.name === 'Träning' ? MaterialCommunityIcons : MaterialIcons;
+          const iconName =
+            route.name === 'Hem' ? 'home'
+            : route.name === 'Analys' ? 'bar-chart'
+            : route.name === 'Träning' ? 'dumbbell'
+            : 'menu-book';
+          return (
+            <Pressable
+              key={route.key}
+              accessibilityRole="button"
+              accessibilityState={isFocused ? { selected: true } : {}}
+              onPress={() => {
+                const event = navigation.emit({ type: 'tabPress', target: route.key, canPreventDefault: true });
+                if (!isFocused && !event.defaultPrevented) navigation.navigate(route.name as never);
+              }}
+              style={styles.floatingTabBarItem}
+            >
+              <View style={styles.floatingTabPill}>
+                {route.name === 'Träning' && hasActiveWorkout ? (
+                  <Animated.View
+                    style={[styles.workoutActiveRing, { opacity: workoutPulseAnim }]}
+                    pointerEvents="none"
+                  />
+                ) : null}
+                <IconComponent name={iconName as never} size={24} color={iconColor} />
+              </View>
+            </Pressable>
+          );
+        })}
+      </View>
     </View>
   );
 }
 
 export default function App() {
+  const [activeTab, setActiveTab] = useState<'Hem' | 'Träning' | 'Analys' | 'Dagbok'>('Hem');
+  const [tabTransitionDirection, setTabTransitionDirection] = useState<TabTransitionDirection>(null);
+  const prevTabIndexRef = useRef(0);
+
+  const clearTabTransitionDirection = useCallback(() => setTabTransitionDirection(null), []);
+  const tabTransitionContextValue = useMemo(
+    () => ({ direction: tabTransitionDirection, clearDirection: clearTabTransitionDirection }),
+    [tabTransitionDirection, clearTabTransitionDirection]
+  );
   const [exercises, setExercises] = useState<Exercise[]>([
     {
       id: '1',
@@ -1971,11 +3474,12 @@ export default function App() {
   ]);
   const [logs, setLogs] = useState<ExerciseLog[]>([]);
   const [painSeries, setPainSeries] = useState<PainSeries[]>([
-    { id: 'p1', name: 'Nacke', value: 4, draftNote: '', entries: buildSeedPainEntries('nacke', 4) },
-    { id: 'p2', name: 'Ländrygg', value: 3, draftNote: '', entries: buildSeedPainEntries('rygg', 3) },
+    { id: 'p1', name: 'Nacke', value: 4, draftNote: '', entries: [] },
+    { id: 'p2', name: 'Ländrygg', value: 3, draftNote: '', entries: [] },
   ]);
   const [workoutPlans, setWorkoutPlans] = useState<WorkoutPlan[]>([]);
   const [completedWorkouts, setCompletedWorkouts] = useState<CompletedWorkout[]>([]);
+  const [exerciseWeightPbs, setExerciseWeightPbs] = useState<ExerciseWeightPb[]>([]);
   const [rehabLibraryExercises, setRehabLibraryExercises] = useState<LibraryExercise[]>(LIBRARY_EXERCISES);
   const [gymLibraryExercises, setGymLibraryExercises] = useState<LibraryExercise[]>(GYM_LIBRARY_EXERCISES);
   const [newSeriesDialog, setNewSeriesDialog] = useState(false);
@@ -1987,7 +3491,7 @@ export default function App() {
   const [wizardMode, setWizardMode] = useState<WizardMode>('create');
   const [wizardExerciseId, setWizardExerciseId] = useState<string | null>(null);
   const [wizardStep, setWizardStep] = useState(0);
-  const [wizardDays, setWizardDays] = useState<WeekdayKey[]>(['mon', 'wed', 'fri']);
+  const [wizardDays, setWizardDays] = useState<WeekdayKey[]>([]);
   const [wizardSets, setWizardSets] = useState('3');
   const [wizardReps, setWizardReps] = useState('10');
   const [wizardWeight, setWizardWeight] = useState('');
@@ -2002,6 +3506,8 @@ export default function App() {
   const [rehabCategoryDraftTags, setRehabCategoryDraftTags] = useState<string[]>([]);
   const [rehabCategoryCustomInput, setRehabCategoryCustomInput] = useState('');
   const [isHydrated, setIsHydrated] = useState(false);
+  const trainingFabActionRef = useRef<(() => void) | null>(null);
+  const [hasActiveWorkout, setHasActiveWorkout] = useState(false);
   const librarySheetMaxDrag = Math.round(Dimensions.get('window').height * 0.92);
   const librarySheetTranslateY = useRef(new Animated.Value(0)).current;
   const librarySheetStartY = useRef(0);
@@ -2010,35 +3516,41 @@ export default function App() {
     const loadPersistedState = async () => {
       try {
         const raw = await AsyncStorage.getItem(STORAGE_KEY);
-        if (!raw) return;
-        const parsed = JSON.parse(raw) as PersistedState;
-        if (Array.isArray(parsed.exercises)) setExercises(parsed.exercises);
-        if (Array.isArray(parsed.logs)) setLogs(parsed.logs);
-        if (Array.isArray(parsed.painSeries)) {
-          const hasAnyEntries = parsed.painSeries.some(
-            (item) => Array.isArray(item.entries) && item.entries.length > 0,
-          );
-          setPainSeries(
-            hasAnyEntries
-              ? parsed.painSeries.map((item) => {
-                  if (item.id === 'p1') {
-                    return { ...item, entries: mergeEntriesWithSeed(item.entries || [], 'nacke', 4) };
-                  }
-                  if (item.id === 'p2') {
-                    return { ...item, entries: mergeEntriesWithSeed(item.entries || [], 'rygg', 3) };
-                  }
-                  return item;
-                })
-              : [
-                  { id: 'p1', name: 'Nacke', value: 4, draftNote: '', entries: buildSeedPainEntries('nacke', 4) },
-                  { id: 'p2', name: 'Ländrygg', value: 3, draftNote: '', entries: buildSeedPainEntries('rygg', 3) },
-                ],
-          );
+        let parsed: Partial<PersistedState> = {};
+        if (raw) {
+          parsed = JSON.parse(raw) as PersistedState;
+          if (Array.isArray(parsed.exercises)) setExercises(parsed.exercises);
+          if (Array.isArray(parsed.logs)) setLogs(parsed.logs);
+          if (Array.isArray(parsed.painSeries)) {
+            setPainSeries(
+              parsed.painSeries.map((item) => {
+                const rawEntries = Array.isArray(item.entries) ? item.entries : [];
+                if (item.id === 'p1') {
+                  return { ...item, entries: stripSeedEntries(rawEntries, 'nacke') };
+                }
+                if (item.id === 'p2') {
+                  return { ...item, entries: stripSeedEntries(rawEntries, 'rygg') };
+                }
+                return { ...item, entries: rawEntries };
+              }),
+            );
+          }
+          if (Array.isArray(parsed.workoutPlans)) setWorkoutPlans(parsed.workoutPlans);
+          if (Array.isArray(parsed.completedWorkouts)) setCompletedWorkouts(parsed.completedWorkouts);
+          if (Array.isArray(parsed.exerciseWeightPbs)) setExerciseWeightPbs(parsed.exerciseWeightPbs);
+          if (Array.isArray(parsed.rehabLibraryExercises)) setRehabLibraryExercises(parsed.rehabLibraryExercises);
+          if (Array.isArray(parsed.gymLibraryExercises)) setGymLibraryExercises(mergeGymLibrary(parsed.gymLibraryExercises));
         }
-        if (Array.isArray(parsed.workoutPlans)) setWorkoutPlans(parsed.workoutPlans);
-        if (Array.isArray(parsed.completedWorkouts)) setCompletedWorkouts(parsed.completedWorkouts);
-        if (Array.isArray(parsed.rehabLibraryExercises)) setRehabLibraryExercises(parsed.rehabLibraryExercises);
-        if (Array.isArray(parsed.gymLibraryExercises)) setGymLibraryExercises(parsed.gymLibraryExercises);
+        // Re-read logs from storage in case background actions wrote new logs.
+        try {
+          const freshRaw = await AsyncStorage.getItem(STORAGE_KEY);
+          if (freshRaw) {
+            const freshParsed = JSON.parse(freshRaw) as PersistedState;
+            if (Array.isArray(freshParsed.logs) && freshParsed.logs.length > (parsed.logs?.length ?? 0)) {
+              setLogs(freshParsed.logs);
+            }
+          }
+        } catch { /* ignore */ }
       } catch {
         // Ignore parse/storage issues and keep defaults.
       } finally {
@@ -2056,153 +3568,284 @@ export default function App() {
       painSeries,
       workoutPlans,
       completedWorkouts,
+      exerciseWeightPbs,
       rehabLibraryExercises,
       gymLibraryExercises,
     };
     AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(payload)).catch(() => {
       // Ignore temporary storage failures.
     });
-  }, [exercises, logs, painSeries, workoutPlans, completedWorkouts, rehabLibraryExercises, gymLibraryExercises, isHydrated]);
+  }, [exercises, logs, painSeries, workoutPlans, completedWorkouts, exerciseWeightPbs, rehabLibraryExercises, gymLibraryExercises, isHydrated]);
+
+  /* ── Deep link import handler ── */
+  const pendingDeepLinkRef = useRef<string | null>(null);
+  const isHydratedRef = useRef(false);
+  useEffect(() => { isHydratedRef.current = isHydrated; }, [isHydrated]);
+
+  function handleImportUrl(url: string) {
+    try {
+      const parsed = Linking.parse(url);
+      const type = parsed.queryParams?.type as string | undefined;
+      const data = parsed.queryParams?.data as string | undefined;
+      if (!type || !data) return;
+
+      // Decode base64 → gunzip → UTF-8 string
+      const { gunzipSync, strFromU8 } = require('fflate') as typeof import('fflate');
+      const binary = atob(data);
+      const compressed = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) compressed[i] = binary.charCodeAt(i);
+      const json = strFromU8(gunzipSync(compressed));
+
+      function makeId() { return `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`; }
+
+      // Expand short-key Exercise format → full Exercise object
+      // Supports both old full-key format and new short-key format.
+      // Short keys: t=title, l=libraryExerciseId(ignored—title already set), d=description,
+      //             c=color, dl=daysLabel, s=sets, r=reps, tm=times, ro=remindersOn(0/1)
+      function expandExercise(raw: Record<string, unknown>): Exercise {
+        return {
+          id: `ex_${makeId()}`,
+          title: (raw.t || raw.title || '') as string,
+          description: (raw.d || raw.description || '') as string,
+          color: (raw.c || raw.color || '#5E81AC') as string,
+          daysLabel: (raw.dl || raw.daysLabel || 'Alla dagar') as string,
+          sets: (raw.s ?? raw.sets ?? 3) as number,
+          reps: (raw.r ?? raw.reps ?? 10) as number,
+          times: (raw.tm || raw.times || []) as string[],
+          remindersOn: raw.ro !== undefined
+            ? Boolean(raw.ro)
+            : raw.remindersOn !== undefined ? Boolean(raw.remindersOn) : true,
+        };
+      }
+
+      // Expand short-key WorkoutPlan format → full WorkoutPlan object
+      // Short keys: i=id, n=name, e=exercises, l=libraryExerciseId (number 1..N eller string), n=custom name, s=sets, r=reps, rp=repsPerSet
+      function expandPlan(raw: Record<string, unknown>): WorkoutPlan {
+        const rawExercises = (raw.e || raw.exercises || []) as Record<string, unknown>[];
+        const libList = gymLibraryExercisesRef.current;
+        const planExercises: WorkoutPlanExercise[] = rawExercises.map((ex) => {
+          const lVal = ex.l ?? ex.libraryExerciseId;
+          let libId: string | undefined;
+          let libName: string | undefined;
+          if (typeof lVal === 'number') {
+            const lib = libList[lVal - 1];
+            if (lib) {
+              libId = lib.id;
+              libName = lib.name;
+            }
+          } else if (typeof lVal === 'string') {
+            libId = lVal;
+            libName = libList.find((e) => e.id === libId)?.name;
+          }
+          const customName = (ex.n ?? ex.name ?? '') as string;
+          const s = (ex.s ?? ex.sets ?? 3) as number;
+          const r = (ex.r ?? ex.reps ?? 10) as number;
+          const rp = (ex.rp ?? ex.repsPerSet) as number[] | undefined;
+          const repsPerSet = Array.isArray(rp) && rp.length > 0 ? rp : Array(s).fill(r);
+          return {
+            id: `ex_${makeId()}`,
+            libraryExerciseId: libId,
+            name: libName || customName,
+            sets: repsPerSet.length,
+            reps: repsPerSet[0] ?? r,
+            repsPerSet,
+          };
+        });
+        return {
+          id: ((raw.i || raw.id) as string | undefined) || `plan_${makeId()}`,
+          name: (raw.n || raw.name || '') as string,
+          exercises: planExercises,
+          createdAtIso: (raw.createdAtIso as string | undefined) || new Date().toISOString(),
+        };
+      }
+
+      if (type === 'exercises') {
+        const rawList = JSON.parse(json) as Record<string, unknown>[];
+        const imported = rawList.map(expandExercise);
+        Alert.alert(
+          'Importera övningar',
+          `Importera ${imported.length} övning${imported.length !== 1 ? 'ar' : ''} från terapeuten?\n\nDina nuvarande dagliga övningar ersätts.`,
+          [
+            { text: 'Avbryt', style: 'cancel' },
+            { text: 'Importera', onPress: () => setExercises(imported) },
+          ]
+        );
+      } else if (type === 'workoutplan') {
+        const plan = expandPlan(JSON.parse(json) as Record<string, unknown>);
+        Alert.alert(
+          'Importera träningspass',
+          `Importera passet "${plan.name}"?`,
+          [
+            { text: 'Avbryt', style: 'cancel' },
+            {
+              text: 'Importera',
+              onPress: () =>
+                setWorkoutPlans((prev) => {
+                  const idx = prev.findIndex((p) => p.id === plan.id);
+                  if (idx >= 0) return prev.map((p) => (p.id === plan.id ? plan : p));
+                  return [...prev, plan];
+                }),
+            },
+          ]
+        );
+      } else if (type === 'workoutplans') {
+        const rawList = JSON.parse(json) as Record<string, unknown>[];
+        const imported = rawList.map(expandPlan);
+        Alert.alert(
+          'Importera träningspass',
+          `Importera ${imported.length} träningspass från terapeuten?`,
+          [
+            { text: 'Avbryt', style: 'cancel' },
+            {
+              text: 'Importera',
+              onPress: () =>
+                setWorkoutPlans((prev) => {
+                  const merged = [...prev];
+                  for (const plan of imported) {
+                    const idx = merged.findIndex((p) => p.id === plan.id);
+                    if (idx >= 0) merged[idx] = plan;
+                    else merged.push(plan);
+                  }
+                  return merged;
+                }),
+            },
+          ]
+        );
+      }
+    } catch {
+      // Ignore malformed or unsupported links
+    }
+  }
+
+  // Capture any link that arrives before state is hydrated
+  useEffect(() => {
+    Linking.getInitialURL().then((url) => {
+      if (url) pendingDeepLinkRef.current = url;
+    });
+    const sub = Linking.addEventListener('url', ({ url }) => {
+      if (isHydratedRef.current) {
+        handleImportUrl(url);
+      } else {
+        pendingDeepLinkRef.current = url;
+      }
+    });
+    return () => sub.remove();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Process any link that was captured before hydration finished
+  useEffect(() => {
+    if (!isHydrated) return;
+    const url = pendingDeepLinkRef.current;
+    if (url) {
+      pendingDeepLinkRef.current = null;
+      handleImportUrl(url);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isHydrated]);
 
   /* ── Notification: refs for latest state (used inside listeners) ── */
   const exercisesRef = useRef(exercises);
   exercisesRef.current = exercises;
   const logsRef = useRef(logs);
   logsRef.current = logs;
+  const gymLibraryExercisesRef = useRef(gymLibraryExercises);
+  gymLibraryExercisesRef.current = gymLibraryExercises;
 
-  /* ── Notification: request permissions + set up action category ── */
+  /* ── Notification: request Android permissions ── */
   useEffect(() => {
     (async () => {
-      if (!Device.isDevice) return;
-
-      // Request permission (iOS shows a dialog, Android auto-grants)
-      const { status: existingStatus } = await Notifications.getPermissionsAsync();
-      if (existingStatus !== 'granted') {
-        await Notifications.requestPermissionsAsync();
-      }
-
-      // Android notification channel
-      if (Platform.OS === 'android') {
-        await Notifications.setNotificationChannelAsync(NOTIFICATION_CHANNEL_ID, {
-          name: 'Övningspåminnelser',
-          importance: Notifications.AndroidImportance.HIGH,
-          vibrationPattern: [0, 250, 250, 250],
-          sound: 'default',
-        });
-      }
-
-      // Notification category with action buttons
-      await Notifications.setNotificationCategoryAsync(NOTIFICATION_CATEGORY_ID, [
-        {
-          identifier: 'done',
-          buttonTitle: 'Gjort ✓',
-          options: { opensAppToForeground: false },
-        },
-        {
-          identifier: 'snooze',
-          buttonTitle: 'Snooze 10 min',
-          options: { opensAppToForeground: false },
-        },
-      ]);
+      if (!Device.isDevice || Platform.OS !== 'android') return;
+      await requestAndroidNotificationPermission();
+      await ensureAndroidExactAlarmPermission();
     })();
   }, []);
 
-  /* ── Notification: handle user action on a notification (Gjort / Snooze / tap) ── */
+  /* ── Android native notifications: consume actions done while app was backgrounded ── */
   useEffect(() => {
-    const subscription = Notifications.addNotificationResponseReceivedListener(
-      async (response) => {
-        const data = response.notification.request.content.data as {
-          exerciseId?: string;
-          exerciseTitle?: string;
-          exerciseSets?: number;
-          exerciseReps?: number;
-          scheduledTimeIso?: string;
-        };
-        const actionId = response.actionIdentifier;
-
-        if (actionId === 'done' && data.exerciseId) {
-          // Register the exercise as done (same as tapping "Registrera" in the app)
-          setLogs((prev) => [
-            ...prev,
-            { exerciseId: data.exerciseId!, atIso: new Date().toISOString() },
-          ]);
-        } else if (actionId === 'snooze' && data.exerciseId) {
-          // Schedule a follow-up reminder in 10 minutes
-          try {
-            await Notifications.scheduleNotificationAsync({
-              content: {
-                title: 'Påminnelse: Övning!',
-                body: `${data.exerciseTitle || 'Övning'} – ${data.exerciseSets ?? ''} set × ${data.exerciseReps ?? ''} reps`,
-                categoryIdentifier: NOTIFICATION_CATEGORY_ID,
-                data,
-                sound: true,
-                ...(Platform.OS === 'android' ? { channelId: NOTIFICATION_CHANNEL_ID } : {}),
-              },
-              trigger: {
-                type: Notifications.SchedulableTriggerInputTypes.TIME_INTERVAL,
-                seconds: SNOOZE_MINUTES * 60,
-                repeats: false,
-              },
-            });
-          } catch {
-            // Ignore snooze scheduling failures
-          }
-        }
-        if (actionId === 'done' || actionId === 'snooze') {
-          try {
-            await Notifications.dismissNotificationAsync(response.notification.request.identifier);
-          } catch {
-            // Ignore dismiss failures on some platforms/states
-          }
-        }
-        // DEFAULT_ACTION_IDENTIFIER = user tapped the notification body → app opens normally
-      },
-    );
-
-    // Also handle the case where the app was killed and opened via notification tap
-    Notifications.getLastNotificationResponseAsync().then((response) => {
-      if (!response) return;
-      const data = response.notification.request.content.data as {
-        exerciseId?: string;
-      };
-      const actionId = response.actionIdentifier;
-      if (actionId === 'done' && data.exerciseId) {
-        setLogs((prev) => [
-          ...prev,
-          { exerciseId: data.exerciseId!, atIso: new Date().toISOString() },
-        ]);
-        Notifications.dismissNotificationAsync(response.notification.request.identifier).catch(() => {});
-      }
-    });
-
-    return () => subscription.remove();
-  }, []);
+    if (!isHydrated || Platform.OS !== 'android') return;
+    (async () => {
+      const pending = await consumeAndroidPendingCompletions().catch(() => []);
+      if (!Array.isArray(pending) || pending.length === 0) return;
+      const incoming: ExerciseLog[] = pending
+        .filter((row) => row?.exerciseId && row?.atIso)
+        .map((row) => ({ exerciseId: row.exerciseId, atIso: row.atIso }));
+      if (incoming.length === 0) return;
+      setLogs((prev) => mergeLogs(prev, incoming));
+    })();
+  }, [isHydrated]);
 
   /* ── Notification: schedule / reschedule whenever exercises or logs change ── */
   useEffect(() => {
     if (!isHydrated) return;
-    // Small debounce so rapid state changes don't cause excessive rescheduling
+    // Schedule immediately when hydrated so OS has notifications even if app is closed quickly
+    scheduleExerciseNotifications(exercises).catch((error) => {
+      console.warn('[notifications] initial schedule failed:', error);
+    });
+    // Debounce reschedule on subsequent changes to avoid excessive rescheduling
     const timer = setTimeout(() => {
-      scheduleExerciseNotifications(exercises, logs).catch(() => {});
+      scheduleExerciseNotifications(exercises).catch((error) => {
+        console.warn('[notifications] debounced schedule failed:', error);
+      });
     }, 500);
     return () => clearTimeout(timer);
   }, [exercises, logs, isHydrated]);
 
-  /* ── Notification: reschedule when the app comes back to the foreground ── */
+  /* ── Notification: reschedule + reload logs when app comes to foreground ── */
   useEffect(() => {
-    const subscription = AppState.addEventListener('change', (nextState) => {
+    const subscription = AppState.addEventListener('change', async (nextState) => {
       if (nextState === 'active' && isHydrated) {
-        scheduleExerciseNotifications(exercisesRef.current, logsRef.current).catch(() => {});
+        let freshLogs: ExerciseLog[] = logsRef.current;
+        try {
+          const raw = await AsyncStorage.getItem(STORAGE_KEY);
+          if (raw) {
+            const parsed = JSON.parse(raw) as PersistedState;
+            if (Array.isArray(parsed.logs)) {
+              freshLogs = parsed.logs;
+              setLogs(parsed.logs);
+            }
+          }
+        } catch { /* ignore */ }
+        if (Platform.OS === 'android') {
+          const pending = await consumeAndroidPendingCompletions().catch(() => []);
+          if (Array.isArray(pending) && pending.length > 0) {
+            const incoming: ExerciseLog[] = pending
+              .filter((row) => row?.exerciseId && row?.atIso)
+              .map((row) => ({ exerciseId: row.exerciseId, atIso: row.atIso }));
+            if (incoming.length > 0) {
+              freshLogs = mergeLogs(freshLogs, incoming);
+              setLogs(freshLogs);
+            }
+          }
+        }
+        scheduleExerciseNotifications(exercisesRef.current).catch((error) => {
+          console.warn('[notifications] app-active schedule failed:', error);
+        });
       }
     });
     return () => subscription.remove();
   }, [isHydrated]);
 
   const closeTimePicker = () => setTimePickerIndex(null);
+  const setTrainingFabAction = useCallback((action: (() => void) | null) => {
+    trainingFabActionRef.current = action;
+  }, []);
   const openLibrarySheet = useCallback(() => {
-    librarySheetTranslateY.setValue(0);
+    librarySheetTranslateY.setValue(80);
+    setLibraryQuery('');
+    setLibraryFilter(null);
     setLibraryVisible(true);
   }, [librarySheetTranslateY]);
+  useEffect(() => {
+    if (libraryVisible) {
+      Animated.spring(librarySheetTranslateY, {
+        toValue: 0,
+        useNativeDriver: true,
+        damping: 22,
+        stiffness: 220,
+      }).start();
+    }
+  }, [libraryVisible, librarySheetTranslateY]);
   const closeLibrarySheet = useCallback(() => {
     Animated.timing(librarySheetTranslateY, {
       toValue: librarySheetMaxDrag,
@@ -2218,8 +3861,8 @@ export default function App() {
     PanResponder.create({
       onStartShouldSetPanResponder: () => true,
       onStartShouldSetPanResponderCapture: () => false,
-      onMoveShouldSetPanResponder: (_, gesture) => gesture.dy > 6,
-      onMoveShouldSetPanResponderCapture: (_, gesture) => gesture.dy > 6,
+      onMoveShouldSetPanResponder: (_, gesture) => Math.abs(gesture.dy) > 8 && Math.abs(gesture.dy) > Math.abs(gesture.dx),
+      onMoveShouldSetPanResponderCapture: (_, gesture) => Math.abs(gesture.dy) > 8 && Math.abs(gesture.dy) > Math.abs(gesture.dx),
       onPanResponderTerminationRequest: () => false,
       onPanResponderGrant: () => {
         librarySheetTranslateY.stopAnimation((value) => {
@@ -2250,7 +3893,7 @@ export default function App() {
     setWizardMode('create');
     setWizardExerciseId(null);
     setWizardStep(0);
-    setWizardDays(['mon', 'wed', 'fri']);
+    setWizardDays([]);
     setWizardSets('3');
     setWizardReps('10');
     setWizardWeight('');
@@ -2373,13 +4016,34 @@ export default function App() {
     setWizardMode('edit');
     setWizardExerciseId(exercise.id);
     setWizardStep(0);
-    setWizardDays(parsedDays.length > 0 ? parsedDays : ['mon']);
+    setWizardDays(parsedDays.length > 0 ? parsedDays : [getTodayWeekdayKey()]);
     setWizardSets(`${Math.max(1, exercise.sets || 1)}`);
     setWizardReps(`${Math.max(1, exercise.reps || 1)}`);
     setWizardWeight(typeof exercise.weightKg === 'number' ? `${exercise.weightKg}` : '');
     setWizardTimesPerDay(`${Math.max(1, exercise.times.length || 1)}`);
     setWizardTimes(exercise.times.length > 0 ? exercise.times : ['09:00']);
   };
+  const globalPlusColor =
+    activeTab === 'Hem'
+      ? '#A5D6A7'
+      : activeTab === 'Träning'
+        ? '#81C784'
+        : activeTab === 'Analys'
+          ? '#90CAF9'
+          : '#FFE082';
+  const onGlobalPlusPress = useCallback(() => {
+    if (activeTab === 'Hem') {
+      openLibrarySheet();
+      return;
+    }
+    if (activeTab === 'Träning') {
+      trainingFabActionRef.current?.();
+      return;
+    }
+    if (activeTab === 'Dagbok') {
+      setNewSeriesDialog(true);
+    }
+  }, [activeTab, openLibrarySheet]);
   const paperTheme = {
     ...MD3DarkTheme,
     colors: {
@@ -2405,58 +4069,92 @@ export default function App() {
   };
 
   return (
-    <GestureHandlerRootView style={{ flex: 1 }}>
+    <GestureHandlerRootView style={{ flex: 1, backgroundColor: APP_BG_COLOR }}>
       <PaperProvider theme={paperTheme}>
-        <NavigationContainer theme={navigationTheme}>
+        <NavigationContainer
+          theme={navigationTheme}
+          onStateChange={(state) => {
+            if (!state) return;
+            const routeName = state.routes?.[state.index ?? 0]?.name;
+            if (routeName === 'Hem' || routeName === 'Träning' || routeName === 'Analys' || routeName === 'Dagbok') {
+              const newIndex = state.index ?? 0;
+              const prevIndex = prevTabIndexRef.current;
+              if (newIndex !== prevIndex) {
+                setTabTransitionDirection(newIndex > prevIndex ? 'right' : 'left');
+                prevTabIndexRef.current = newIndex;
+              }
+              setActiveTab(routeName);
+            }
+          }}
+        >
           <StatusBar style="light" />
-          <Tab.Navigator
-            screenOptions={({ route }) => ({
-              headerShown: false,
-              tabBarStyle: { backgroundColor: '#151D26', borderTopColor: '#24313E' },
-              tabBarActiveTintColor: '#81C784',
-              tabBarInactiveTintColor: '#90A4B8',
-              tabBarIcon: ({ color, size }) => {
-                if (route.name === 'Hem') return <MaterialIcons name="home" size={size} color={color} />;
-                if (route.name === 'Analys') return <MaterialIcons name="insights" size={size} color={color} />;
-                if (route.name === 'Träning') return <MaterialCommunityIcons name="dumbbell" size={size} color={color} />;
-                return <MaterialIcons name="menu-book" size={size} color={color} />;
-              },
-            })}
-          >
-            <Tab.Screen
-              name="Hem"
-              options={{ title: 'Hem' }}
+          <TabTransitionContext.Provider value={tabTransitionContextValue}>
+            <Tab.Navigator
+              screenOptions={{
+                headerShown: false,
+                tabBarStyle: { display: 'none' },
+                sceneStyle: { backgroundColor: APP_BG_COLOR },
+                freezeOnBlur: false,
+              }}
+              tabBar={({ state, navigation }) => <FloatingTabBar state={state} navigation={navigation} hasActiveWorkout={hasActiveWorkout} />}
             >
-              {() => (
-                <HomeScreen
-                  exercises={exercises}
-                  setExercises={setExercises}
-                  onQuickLog={(exerciseId) => setLogs((prev) => [...prev, { exerciseId, atIso: new Date().toISOString() }])}
-                  onAddExercise={openLibrarySheet}
-                  onEditExercise={openEditWizard}
-                  onDeleteExercise={(exercise) => setDeleteDialogExercise(exercise)}
-                />
-              )}
-            </Tab.Screen>
-            <Tab.Screen name="Träning" options={{ title: 'Träning' }}>
-              {() => (
-                <TrainingScreen
-                  workoutPlans={workoutPlans}
-                  setWorkoutPlans={setWorkoutPlans}
-                  completedWorkouts={completedWorkouts}
-                  setCompletedWorkouts={setCompletedWorkouts}
-                  gymLibraryExercises={gymLibraryExercises}
-                  setGymLibraryExercises={setGymLibraryExercises}
-                />
-              )}
-            </Tab.Screen>
-            <Tab.Screen name="Analys" options={{ title: 'Analys' }}>
-              {() => <AnalysisScreen exercises={exercises} logs={logs} />}
-            </Tab.Screen>
-            <Tab.Screen name="Dagbok" options={{ title: 'Dagbok' }}>
-              {() => <DiaryScreen series={painSeries} setSeries={setPainSeries} onAddSeries={() => setNewSeriesDialog(true)} />}
-            </Tab.Screen>
-          </Tab.Navigator>
+              <Tab.Screen
+                name="Hem"
+                options={{ title: 'Hem' }}
+              >
+                {() => (
+                  <AnimatedTabScreen>
+                    <HomeScreen
+                      exercises={exercises}
+                      setExercises={setExercises}
+                      onQuickLog={(exerciseId) => setLogs((prev) => [...prev, { exerciseId, atIso: new Date().toISOString() }])}
+                      onEditExercise={openEditWizard}
+                      onDeleteExercise={(exercise) => setDeleteDialogExercise(exercise)}
+                    />
+                  </AnimatedTabScreen>
+                )}
+              </Tab.Screen>
+              <Tab.Screen name="Träning" options={{ title: 'Träning' }}>
+                {() => (
+                  <AnimatedTabScreen>
+                    <TrainingScreen
+                      workoutPlans={workoutPlans}
+                      setWorkoutPlans={setWorkoutPlans}
+                      completedWorkouts={completedWorkouts}
+                      setCompletedWorkouts={setCompletedWorkouts}
+                      exerciseWeightPbs={exerciseWeightPbs}
+                      setExerciseWeightPbs={setExerciseWeightPbs}
+                      gymLibraryExercises={gymLibraryExercises}
+                      setGymLibraryExercises={setGymLibraryExercises}
+                      onFabActionChange={setTrainingFabAction}
+                      onActiveSessionChange={setHasActiveWorkout}
+                    />
+                  </AnimatedTabScreen>
+                )}
+              </Tab.Screen>
+              <Tab.Screen name="Analys" options={{ title: 'Analys' }}>
+                {() => (
+                  <AnimatedTabScreen>
+                    <AnalysisScreen exercises={exercises} logs={logs} />
+                  </AnimatedTabScreen>
+                )}
+              </Tab.Screen>
+              <Tab.Screen name="Dagbok" options={{ title: 'Dagbok' }}>
+                {() => (
+                  <AnimatedTabScreen>
+                    <DiaryScreen series={painSeries} setSeries={setPainSeries} />
+                  </AnimatedTabScreen>
+                )}
+              </Tab.Screen>
+            </Tab.Navigator>
+          </TabTransitionContext.Provider>
+          <Pressable
+            accessibilityRole="button"
+            onPress={onGlobalPlusPress}
+            style={[styles.navPlusButton, { backgroundColor: globalPlusColor }]}
+          >
+            <MaterialIcons name="add" size={32} color="#0F1419" />
+          </Pressable>
         </NavigationContainer>
 
         <Modal visible={libraryVisible} transparent animationType="none" onRequestClose={closeLibrarySheet}>
@@ -2481,29 +4179,48 @@ export default function App() {
                 placeholder="Sök övning"
                 placeholderTextColor={PLACEHOLDER_COLOR}
               />
-              <ScrollView
+              <RNScrollView
                 horizontal
                 showsHorizontalScrollIndicator={false}
                 style={styles.filterRow}
                 contentContainerStyle={styles.filterRowContent}
               >
+                <Pressable
+                  key="rehab-filter-all"
+                  style={[
+                    styles.chip,
+                    styles.gymFilterChipSmall,
+                    libraryFilter === null && styles.chipActive,
+                    libraryFilter === null && styles.gymFilterChipActive,
+                  ]}
+                  onPress={() => setLibraryFilter(null)}
+                >
+                  <Text style={[styles.chipText, styles.gymFilterChipTextSmall, libraryFilter === null && styles.chipTextActive]}>Alla</Text>
+                </Pressable>
                 {rehabBodyPartFilters.map((tag) => {
                   const active = libraryFilter === tag;
                   return (
                     <Pressable
                       key={tag}
-                      style={[styles.chip, styles.gymFilterChip, active && styles.chipActive, active && styles.gymFilterChipActive]}
+                      style={[styles.chip, styles.gymFilterChipSmall, active && styles.chipActive, active && styles.gymFilterChipActive]}
                       onPress={() =>
                         setLibraryFilter((prev) => (prev === tag ? null : tag))
                       }
                     >
-                      <Text style={[styles.chipText, styles.gymFilterChipText, active && styles.chipTextActive]}>{tag}</Text>
+                      <Text style={[styles.chipText, styles.gymFilterChipTextSmall, active && styles.chipTextActive]}>{tag}</Text>
                     </Pressable>
                   );
                 })}
-              </ScrollView>
-              <ScrollView nestedScrollEnabled keyboardShouldPersistTaps="handled" bounces={false} overScrollMode="never" contentContainerStyle={styles.libraryList}>
-                {libraryQuery.trim().length > 0 && !hasExactRehabMatch ? (
+              </RNScrollView>
+              <FlatList
+                style={styles.libraryListScroll}
+                data={filteredLibrary}
+                keyExtractor={(exercise) => exercise.id}
+                keyboardShouldPersistTaps="handled"
+                bounces={false}
+                overScrollMode="never"
+                contentContainerStyle={styles.libraryList}
+                ListHeaderComponent={libraryQuery.trim().length > 0 && !hasExactRehabMatch ? (
                   <View style={styles.libraryItem}>
                     <View style={styles.libraryItemMain}>
                       <Text style={styles.libraryName}>Vill du lägga till "{libraryQuery.trim()}"?</Text>
@@ -2513,13 +4230,14 @@ export default function App() {
                         </View>
                       </View>
                     </View>
-                    <Button mode="contained-tonal" onPress={addCustomRehabExercise}>
+                    <Button mode="contained" onPress={addCustomRehabExercise} contentStyle={styles.libraryItemButton} labelStyle={{ fontSize: 11 }}>
                       Lägg till
                     </Button>
                   </View>
                 ) : null}
-                {filteredLibrary.map((exercise) => (
-                  <View key={exercise.id} style={styles.libraryItem}>
+                ListEmptyComponent={<Text style={styles.logEmpty}>Inga övningar matchar filtret.</Text>}
+                renderItem={({ item: exercise }) => (
+                  <View style={styles.libraryItem}>
                     <View style={styles.libraryItemMain}>
                       <Text style={styles.libraryName}>{exercise.name}</Text>
                       <View style={styles.libraryTagWrap}>
@@ -2531,7 +4249,7 @@ export default function App() {
                       </View>
                     </View>
                     <Button
-                      mode="contained-tonal"
+                      mode="contained"
                       onPress={() => {
                         librarySheetTranslateY.setValue(0);
                         setLibraryVisible(false);
@@ -2540,13 +4258,14 @@ export default function App() {
                         setWizardExerciseId(null);
                         setWizardStep(0);
                       }}
+                      contentStyle={styles.libraryItemButton}
+                      labelStyle={{ fontSize: 11 }}
                     >
                       Välj
                     </Button>
                   </View>
-                ))}
-                {filteredLibrary.length === 0 ? <Text style={styles.logEmpty}>Inga övningar matchar filtret.</Text> : null}
-              </ScrollView>
+                )}
+              />
               </View>
             </Animated.View>
             {rehabCategoryEditorVisible && (
@@ -2562,7 +4281,7 @@ export default function App() {
                       placeholder="Egen kategori"
                       placeholderTextColor={PLACEHOLDER_COLOR}
                     />
-                    <Button mode="contained-tonal" onPress={addRehabCustomCategory}>
+                    <Button mode="contained" onPress={addRehabCustomCategory}>
                       Lägg till
                     </Button>
                   </View>
@@ -2582,7 +4301,7 @@ export default function App() {
                   </ScrollView>
                   <View style={styles.timePickerActions}>
                     <Button onPress={closeRehabCategoryEditor}>Avbryt</Button>
-                    <Button onPress={saveRehabCategoryEditor}>Spara</Button>
+                    <Button mode="contained" onPress={saveRehabCategoryEditor}>Spara</Button>
                   </View>
                 </View>
               </View>
@@ -2593,32 +4312,63 @@ export default function App() {
         <Modal visible={!!wizardExercise} transparent animationType="slide" onRequestClose={resetWizard}>
           <View style={styles.bottomSheetBackdrop}>
             <Pressable style={styles.backdropTapZone} onPress={resetWizard} />
-            <View style={styles.bottomSheet}>
+            <View style={[styles.bottomSheet, styles.wizardBottomSheet]}>
               <View style={styles.bottomSheetHandle} />
               <Text style={styles.bottomSheetTitle}>
                 {wizardMode === 'edit' ? 'Redigera plan' : 'Skapa plan'}: {wizardExercise?.name}
               </Text>
               <Text style={styles.wizardStepLabel}>Steg {wizardStep + 1} av 3</Text>
+              <View style={styles.wizardContentArea}>
               {wizardStep === 0 ? (
                 <View style={styles.wizardBlock}>
                   <Text style={styles.wizardSectionTitle}>1) Välj dagar</Text>
-                  <View style={styles.chipWrap}>
-                    {WEEKDAY_CHIPS.map((day) => {
-                      const active = wizardDays.includes(day.key);
-                      return (
-                        <Pressable
-                          key={day.key}
-                          style={[styles.chip, active && styles.chipActive]}
-                          onPress={() =>
-                            setWizardDays((prev) =>
-                              prev.includes(day.key) ? prev.filter((item) => item !== day.key) : [...prev, day.key],
-                            )
-                          }
-                        >
-                          <Text style={[styles.chipText, active && styles.chipTextActive]}>{day.label}</Text>
-                        </Pressable>
-                      );
-                    })}
+                  <Pressable
+                    style={[styles.chip, styles.varjeDagChip, wizardDays.length === 7 && styles.chipActive]}
+                    onPress={() =>
+                      setWizardDays((prev) =>
+                        prev.length === 7 ? [] : WEEKDAY_CHIPS.map((d) => d.key),
+                      )
+                    }
+                  >
+                    <Text style={[styles.chipText, wizardDays.length === 7 && styles.chipTextActive]}>Varje dag</Text>
+                  </Pressable>
+                  <View style={styles.dayRowsWrap}>
+                    <View style={styles.chipWrapSingleRow}>
+                      {WEEKDAY_CHIPS.slice(0, 5).map((day) => {
+                        const active = wizardDays.includes(day.key);
+                        return (
+                          <Pressable
+                            key={day.key}
+                            style={[styles.chip, styles.dayChip, active && styles.chipActive]}
+                            onPress={() =>
+                              setWizardDays((prev) =>
+                                prev.includes(day.key) ? prev.filter((item) => item !== day.key) : [...prev, day.key],
+                              )
+                            }
+                          >
+                            <Text style={[styles.chipText, active && styles.chipTextActive]}>{day.label}</Text>
+                          </Pressable>
+                        );
+                      })}
+                    </View>
+                    <View style={[styles.chipWrapSingleRow, styles.chipWrapWeekendRow]}>
+                      {WEEKDAY_CHIPS.slice(5, 7).map((day) => {
+                        const active = wizardDays.includes(day.key);
+                        return (
+                          <Pressable
+                            key={day.key}
+                            style={[styles.chip, styles.dayChipWeekend, active && styles.chipActive]}
+                            onPress={() =>
+                              setWizardDays((prev) =>
+                                prev.includes(day.key) ? prev.filter((item) => item !== day.key) : [...prev, day.key],
+                              )
+                            }
+                          >
+                            <Text style={[styles.chipText, active && styles.chipTextActive]}>{day.label}</Text>
+                          </Pressable>
+                        );
+                      })}
+                    </View>
                   </View>
                 </View>
               ) : null}
@@ -2760,6 +4510,7 @@ export default function App() {
                   </View>
                 </View>
               ) : null}
+              </View>
               <View style={styles.wizardActions}>
                 <Button onPress={resetWizard}>Avbryt</Button>
                 {wizardStep > 0 ? <Button onPress={() => setWizardStep((prev) => prev - 1)}>Tillbaka</Button> : null}
@@ -2773,7 +4524,7 @@ export default function App() {
                       const sets = Math.max(1, Number.parseInt(wizardSets, 10) || 1);
                       const reps = Math.max(1, Number.parseInt(wizardReps, 10) || 1);
                       const weight = Number.parseFloat(wizardWeight);
-                      const activeDays: WeekdayKey[] = wizardDays.length === 0 ? ['mon'] : wizardDays;
+                      const activeDays: WeekdayKey[] = wizardDays.length === 0 ? [getTodayWeekdayKey()] : wizardDays;
                       const daysLabel = activeDays.length === 7 ? 'Varje dag' : activeDays.map((day) => WEEKDAY_LABEL_BY_KEY[day]).join(', ');
                       const nextExercisePatch = {
                         title: wizardExercise.name,
@@ -2786,8 +4537,14 @@ export default function App() {
                         remindersOn: true,
                       };
                       if (wizardMode === 'edit' && wizardExerciseId) {
-                        setExercises((prev) => prev.map((item) => (item.id === wizardExerciseId ? { ...item, ...nextExercisePatch } : item)));
+                        const updatedExercises = exercises.map((item) =>
+                          item.id === wizardExerciseId ? { ...item, ...nextExercisePatch } : item,
+                        );
+                        setExercises(updatedExercises);
                         resetWizard();
+                        scheduleExerciseNotifications(updatedExercises).catch((error) => {
+                          console.warn('[notifications] wizard save schedule failed:', error);
+                        });
                         return;
                       }
                       const idx = exercises.length % SERIES_COLORS.length;
@@ -2873,7 +4630,9 @@ export default function App() {
             <Dialog.Actions>
               <Button onPress={() => setDeleteDialogExercise(null)}>Avbryt</Button>
               <Button
-                textColor="#EF9A9A"
+                mode="contained"
+                buttonColor="#C62828"
+                textColor="#FFEBEE"
                 onPress={() => {
                   if (!deleteDialogExercise) return;
                   setExercises((prev) => prev.filter((item) => item.id !== deleteDialogExercise.id));
@@ -2899,6 +4658,7 @@ export default function App() {
             <Dialog.Actions>
               <Button onPress={() => setNewSeriesDialog(false)}>Avbryt</Button>
               <Button
+                mode="contained"
                 onPress={() => {
                   if (!newSeriesName.trim()) return;
                   setPainSeries((prev) => [...prev, { id: `${Date.now()}`, name: newSeriesName.trim(), value: 5, draftNote: '', entries: [] }]);
@@ -2918,8 +4678,90 @@ export default function App() {
 }
 
 const styles = StyleSheet.create({
+  floatingTabBarOuter: {
+    position: 'absolute',
+    bottom: 28,
+    left: 0,
+    right: 0,
+    alignItems: 'center',
+  },
+  floatingTabBar: {
+    width: '90%',
+    height: 78,
+    backgroundColor: '#151D26',
+    borderRadius: 39,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-around',
+    paddingHorizontal: 14,
+    elevation: 8,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.22,
+    shadowRadius: 8,
+  },
+  floatingTabBarItem: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  floatingTabBarIconWrap: {
+    height: '100%',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  floatingTabPill: {
+    width: 52,
+    height: 52,
+    borderRadius: 26,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  workoutActiveRing: {
+    position: 'absolute',
+    top: -3,
+    left: -3,
+    right: -3,
+    bottom: -3,
+    borderRadius: 29,
+    borderWidth: 2,
+    borderColor: '#EF5350',
+  },
+  floatingTabPillSliding: {
+    position: 'absolute',
+    left: 0,
+    top: 13,
+    width: TAB_PILL_WIDTH,
+    height: TAB_PILL_HEIGHT,
+    borderRadius: TAB_PILL_HEIGHT / 2,
+    backgroundColor: '#2563A8',
+  },
+  floatingTabPillActive: {
+    backgroundColor: '#2563A8',
+    borderRadius: 26,
+  },
+  navPlusButton: {
+    position: 'absolute',
+    alignSelf: 'center',
+    width: 64,
+    height: 64,
+    borderRadius: 32,
+    bottom: 82,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 4,
+    borderColor: '#0F1419',
+    zIndex: 60,
+    elevation: 14,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 8 },
+    shadowOpacity: 0.32,
+    shadowRadius: 10,
+  },
   screen: { flex: 1, backgroundColor: '#0F1419' },
   screenTitle: { color: '#E3EAF2', fontSize: 32, fontWeight: '800', paddingHorizontal: 16, paddingTop: 14, paddingBottom: 6 },
+  minimalTriggerTestButton: { alignSelf: 'flex-start', marginHorizontal: 16, marginBottom: 8, paddingVertical: 6, paddingHorizontal: 12, backgroundColor: '#33414F', borderRadius: 8 },
+  minimalTriggerTestText: { color: '#88C0D0', fontSize: 13 },
   screenTitleSmall: { color: '#E3EAF2', fontSize: 24, fontWeight: '700', paddingHorizontal: 16, paddingTop: 10, paddingBottom: 4 },
   listContent: { padding: 12, gap: 12, paddingBottom: 120 },
   exerciseCard: {
@@ -2943,7 +4785,6 @@ const styles = StyleSheet.create({
   emptyState: { flex: 1, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 24 },
   emptyTitle: { fontSize: 20, fontWeight: '700', color: '#DCE4EC', textAlign: 'center' },
   emptySubtitle: { marginTop: 6, fontSize: 15, color: '#9AAEC0', textAlign: 'center' },
-  fab: { position: 'absolute', right: 16, bottom: 22 },
   swipeActions: { justifyContent: 'center', marginBottom: 8 },
   swipeActionsLeft: { paddingRight: 8 },
   swipeActionsRight: { paddingLeft: 8 },
@@ -2977,15 +4818,15 @@ const styles = StyleSheet.create({
   gymBottomSheet: {
     minHeight: '92%',
     maxHeight: '92%',
-    borderTopLeftRadius: 0,
-    borderTopRightRadius: 0,
+    borderTopLeftRadius: 18,
+    borderTopRightRadius: 18,
     paddingTop: 0,
   },
   libraryBottomSheet: {
     minHeight: '92%',
     maxHeight: '92%',
-    borderTopLeftRadius: 0,
-    borderTopRightRadius: 0,
+    borderTopLeftRadius: 18,
+    borderTopRightRadius: 18,
     paddingTop: 0,
   },
   // (gymAnimatedSheet removed – renderToHardwareTextureAndroid moved to prop)
@@ -3027,11 +4868,19 @@ const styles = StyleSheet.create({
     alignSelf: 'center',
     marginBottom: 10,
   },
-  bottomSheetTitle: { color: '#E3EAF2', fontSize: 20, fontWeight: '700' },
-  librarySearch: { marginTop: 10 },
-  filterRow: { marginTop: 10, flexGrow: 0 },
-  filterRowContent: { paddingVertical: 8, gap: 8, paddingRight: 12, alignItems: 'center' },
+  bottomSheetTitle: { color: '#E3EAF2', fontSize: 18, fontWeight: '700' },
+  librarySearch: { marginTop: 6 },
+  filterRow: { marginTop: 6, flexGrow: 0 },
+  filterRowSecond: { marginTop: 0 },
+  filterRowContent: { paddingVertical: 6, gap: 8, paddingRight: 12, alignItems: 'center' },
+  filterRowContentSecond: { paddingTop: 0, paddingBottom: 6, gap: 8, paddingRight: 12, alignItems: 'center' },
   chipWrap: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
+  chipWrapSingleRow: { flexDirection: 'row', flexWrap: 'nowrap', gap: 6, marginTop: 8 },
+  chipWrapWeekendRow: { justifyContent: 'center' },
+  dayRowsWrap: { gap: 6 },
+  varjeDagChip: { alignSelf: 'flex-start' },
+  dayChip: { flex: 1, minWidth: 0, justifyContent: 'center', alignItems: 'center' },
+  dayChipWeekend: { width: 72, justifyContent: 'center', alignItems: 'center' },
   chip: {
     borderRadius: 999,
     borderWidth: 1,
@@ -3048,31 +4897,42 @@ const styles = StyleSheet.create({
     backgroundColor: '#1D2732',
     borderColor: '#5A6B7B',
   },
-  gymFilterChipActive: { borderColor: '#7BCF9A' },
-  chipActive: { backgroundColor: '#2D7A49', borderColor: '#53A772' },
+  gymFilterChipSmall: {
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    minHeight: 38,
+    justifyContent: 'center',
+    backgroundColor: '#1D2732',
+    borderColor: '#5A6B7B',
+  },
+  gymFilterChipActive: { borderColor: '#5B9ECF' },
+  chipActive: { backgroundColor: '#1B3855', borderColor: '#4D8FBF' },
   chipText: { color: '#E3EAF2', fontWeight: '600', lineHeight: 20, fontSize: 14 },
   gymFilterChipText: { color: '#F2F7FC', fontSize: 15, fontWeight: '700', lineHeight: 22 },
-  chipTextActive: { color: '#EAF8F0' },
-  libraryList: { gap: 10, paddingTop: 12, paddingBottom: 20, flexGrow: 1 },
+  gymFilterChipTextSmall: { color: '#F2F7FC', fontSize: 13, fontWeight: '700', lineHeight: 20 },
+  chipTextActive: { color: '#CCE4FF' },
+  libraryListScroll: { flex: 1 },
+  libraryList: { gap: 6, paddingTop: 8, paddingBottom: 12 },
   libraryItem: {
     borderWidth: 1,
     borderColor: '#273644',
-    borderRadius: 12,
+    borderRadius: 10,
     backgroundColor: '#1A222C',
-    padding: 10,
+    padding: 8,
     flexDirection: 'row',
-    gap: 10,
+    gap: 8,
     alignItems: 'center',
   },
-  libraryItemMain: { flex: 1, gap: 8 },
-  libraryName: { color: '#E3EAF2', fontSize: 16, fontWeight: '700' },
-  libraryTagWrap: { flexDirection: 'row', flexWrap: 'wrap', gap: 6 },
-  libraryTag: { borderRadius: 999, backgroundColor: '#2B3A48', paddingHorizontal: 11, paddingVertical: 6 },
-  libraryTagText: { color: '#D3E7F8', fontSize: 13, fontWeight: '700' },
-  wizardStepLabel: { marginTop: 2, color: '#8FA1B3' },
-  wizardBlock: { marginTop: 12, gap: 10 },
+  libraryItemMain: { flex: 1, gap: 4 },
+  libraryName: { color: '#E3EAF2', fontSize: 15, fontWeight: '700' },
+  libraryTagWrap: { flexDirection: 'row', flexWrap: 'wrap', gap: 4 },
+  libraryTag: { borderRadius: 999, backgroundColor: '#2B3A48', paddingHorizontal: 8, paddingVertical: 4 },
+  libraryTagText: { color: '#D3E7F8', fontSize: 12, fontWeight: '700' },
+  libraryItemButton: { minWidth: 0, minHeight: 0, paddingVertical: 2, paddingHorizontal: 8 },
+  wizardStepLabel: { marginTop: 2, marginBottom: 4, color: '#8FA1B3' },
+  wizardBlock: { marginTop: 24, gap: 10 },
   wizardSectionTitle: { color: '#DCE4EC', fontSize: 16, fontWeight: '700' },
-  wizardFieldLabel: { color: '#A8BACB', fontSize: 13 },
+  wizardFieldLabel: { color: '#A8BACB', fontSize: 13, marginBottom: 10 },
   numberStepperRow: { flexDirection: 'row', alignItems: 'center', gap: 10 },
   stepperButton: {
     width: 42,
@@ -3098,7 +4958,9 @@ const styles = StyleSheet.create({
   },
   stepperValueText: { color: '#E3EAF2', fontSize: 16, fontWeight: '700' },
   timeChip: { minWidth: 132 },
-  wizardActions: { marginTop: 14, flexDirection: 'row', justifyContent: 'flex-end', gap: 8 },
+  wizardBottomSheet: { height: '74%' },
+  wizardContentArea: { flex: 1, minHeight: 180 },
+  wizardActions: { marginTop: 28, paddingBottom: 8, flexDirection: 'row', justifyContent: 'flex-end', gap: 8 },
   timePickerBackdrop: { flex: 1, backgroundColor: 'rgba(0, 0, 0, 0.62)', justifyContent: 'center', paddingHorizontal: 18 },
   timePickerCard: {
     backgroundColor: '#151D26',
@@ -3109,15 +4971,15 @@ const styles = StyleSheet.create({
     paddingTop: 12,
     paddingBottom: 8,
   },
-  timePickerTitle: { color: '#E3EAF2', fontSize: 18, fontWeight: '700', textAlign: 'center', marginBottom: 8 },
+  timePickerTitle: { color: '#FFFFFF', fontSize: 18, fontWeight: '700', textAlign: 'center', marginBottom: 8 },
   timePickerStepRow: { gap: 6, marginBottom: 8 },
-  timePreviewText: { color: '#9EC0DC', textAlign: 'center', fontSize: 14, fontWeight: '600', marginTop: 4 },
+  timePreviewText: { color: '#FFFFFF', textAlign: 'center', fontSize: 14, fontWeight: '600', marginTop: 4 },
   timePickerActions: { marginTop: 4, flexDirection: 'row', justifyContent: 'flex-end', gap: 8 },
   deleteDialogText: { color: '#DCE4EC', fontSize: 15, lineHeight: 22 },
   dropdownRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 12, paddingTop: 10 },
-  dropdownHint: { color: '#9AAEC0' },
+  dropdownHint: { color: '#FFFFFF' },
   dropdownItem: { flexDirection: 'row', alignItems: 'center', paddingVertical: 4, gap: 8 },
-  dropdownText: { flex: 1, fontSize: 15, color: '#DCE4EC' },
+  dropdownText: { flex: 1, fontSize: 15, color: '#FFFFFF' },
   dot: { width: 10, height: 10, borderRadius: 5 },
   chartCard: { marginHorizontal: 12, marginTop: 8, backgroundColor: '#151D26', borderRadius: 14, paddingVertical: 10, borderWidth: 1, borderColor: '#24313E' },
   monthTitle: { marginTop: 10, textAlign: 'center', fontSize: 22, fontWeight: '700', color: '#DCE4EC' },
@@ -3125,10 +4987,12 @@ const styles = StyleSheet.create({
   diaryMonthTitle: { marginTop: 0, textAlign: 'center' },
   diaryViewButtonWrap: { position: 'absolute', right: 0 },
   axisRow: { flexDirection: 'row', width: DAY_WIDTH * 68 },
-  axisDay: { width: DAY_WIDTH, alignItems: 'center', paddingVertical: 2 },
-  axisWeek: { fontSize: 12, color: '#8FA1B3' },
-  axisDate: { fontSize: 11, color: '#8FA1B3' },
+  axisDay: { width: DAY_WIDTH, alignItems: 'center', justifyContent: 'center', paddingVertical: 2 },
+  axisWeek: { fontSize: 12, color: '#8FA1B3', textAlign: 'center', width: '100%' },
+  axisDate: { fontSize: 11, color: '#8FA1B3', textAlign: 'center', width: '100%' },
+  axisIdag: { fontSize: 11, color: 'transparent', textAlign: 'center', width: '100%', minHeight: 14 },
   todayText: { fontWeight: '700', color: '#7FC8FF' },
+  chartHelpText: { marginTop: 6, color: '#9AAEC0', fontSize: 12, textAlign: 'center' },
   diaryChartCanvas: { height: 230, position: 'relative' },
   diaryPointOverlay: { ...StyleSheet.absoluteFillObject },
   diaryPointHitbox: { position: 'absolute', width: 24, height: 24, borderRadius: 12 },
@@ -3139,7 +5003,7 @@ const styles = StyleSheet.create({
   seriesCard: { backgroundColor: '#151D26', borderRadius: 14, padding: 12, borderWidth: 1, borderColor: '#24313E' },
   activeSeriesCard: { borderWidth: 1.5, borderColor: '#7FC8FF' },
   seriesHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
-  seriesTitle: { fontSize: 18, fontWeight: '700', color: '#DCE4EC' },
+  seriesTitle: { fontSize: 18, fontWeight: '700', color: '#FFFFFF' },
   badge: { alignSelf: 'flex-start', backgroundColor: '#C8E6C9', borderRadius: 999, paddingHorizontal: 12, paddingVertical: 4, marginTop: 8 },
   badgeText: { fontWeight: '700', color: '#2E7D32' },
   noteInput: { minHeight: 54, marginTop: 8, textAlignVertical: 'top' },
@@ -3162,26 +5026,104 @@ const styles = StyleSheet.create({
   },
   trainingHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
   trainingHeaderActions: { flexDirection: 'row', gap: 12 },
-  trainingTitle: { color: '#E3EAF2', fontSize: 18, fontWeight: '700' },
+  trainingTitle: { color: '#FFFFFF', fontSize: 18, fontWeight: '700' },
   trainingHomeButtonsRow: { flexDirection: 'row', gap: 8 },
   trainingHomeButton: { flex: 1 },
   trainingHomeButtonContent: { minHeight: 52 },
+  trainingHomeButtonCustom: {
+    flex: 1,
+    borderRadius: 14,
+    backgroundColor: '#2D3F53',
+    paddingHorizontal: 13,
+    paddingVertical: 14,
+    alignItems: 'center',
+    justifyContent: 'center',
+    minHeight: 52,
+  },
+  trainingHomeButtonText: { color: '#FFFFFF', fontWeight: '700', fontSize: 15, textAlign: 'center' },
+  trainingTransitionHost: { flex: 1, overflow: 'hidden' },
+  trainingViewWrap: { flex: 1, backgroundColor: APP_BG_COLOR },
+  trainingBlurOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    zIndex: 15,
+    elevation: 15,
+  },
+  trainingPreviewOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    zIndex: 16,
+    elevation: 16,
+    backgroundColor: APP_BG_COLOR,
+    borderRadius: 16,
+    overflow: 'hidden',
+  },
+  trainingHomeCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#1A222C',
+    borderRadius: 16,
+    padding: 16,
+    minHeight: 72,
+    gap: 14,
+    overflow: 'hidden',
+  },
+  trainingHomeCardHalf: { flex: 1, minWidth: 0 },
+  trainingHomeCardRow: { flexDirection: 'row', gap: 12 },
+  trainingHomeCardStacked: {
+    flexDirection: 'column',
+    alignItems: 'flex-start',
+    backgroundColor: '#1A222C',
+    borderRadius: 16,
+    padding: 16,
+    minHeight: 72,
+    gap: 10,
+    overflow: 'hidden',
+  },
+  trainingHomeCardStackedTop: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    width: '100%',
+  },
+  trainingHomeCardTitleWrap: { flex: 1, minWidth: 0, justifyContent: 'center' },
+  trainingHomeCardStackedText: { width: '100%', gap: 2 },
+  trainingHomeCardIconWrap: {
+    width: 44,
+    height: 44,
+    borderRadius: 12,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  trainingHomeCardTextWrap: { flex: 1, justifyContent: 'center', minWidth: 0, overflow: 'hidden' },
+  trainingHomeCardTitle: { color: '#FFFFFF', fontWeight: '700', fontSize: 15, flexShrink: 1 },
+  trainingHomeCardSubtitle: { color: '#8FA1B3', fontSize: 12, marginTop: 2, flexShrink: 1 },
+  preloadedPlaceholderCard: {
+    backgroundColor: '#1A222C',
+    borderRadius: 16,
+    padding: 24,
+    alignItems: 'center',
+    gap: 12,
+  },
+  preloadedPlaceholderTitle: { color: '#FFFFFF', fontWeight: '700', fontSize: 18 },
+  preloadedPlaceholderText: { color: '#8FA1B3', fontSize: 14, textAlign: 'center', lineHeight: 20 },
   trainingPrimaryAction: {
     borderRadius: 14,
-    borderWidth: 1,
-    borderColor: '#67AF86',
-    backgroundColor: '#234436',
+    backgroundColor: '#40504A',
     paddingVertical: 16,
     paddingHorizontal: 14,
     gap: 6,
+    alignItems: 'center',
   },
-  trainingPrimaryTitle: { color: '#E6F6EC', fontWeight: '800', fontSize: 20, textAlign: 'center' },
-  trainingPrimarySubtitle: { color: '#C9EAD7', fontSize: 13, textAlign: 'center' },
+  trainingPrimaryTitle: { color: '#FFFFFF', fontWeight: '800', fontSize: 20, textAlign: 'center' },
+  trainingPrimarySubtitle: { color: '#FFFFFF', fontSize: 13, textAlign: 'center' },
+  trainingPbOverviewButton: {
+    backgroundColor: '#55534A',
+  },
+  trainingPbOverviewTitle: { color: '#FFFFFF' },
+  trainingPbOverviewSubtitle: { color: '#FFFFFF' },
   ongoingWorkoutButton: {
-    borderColor: '#58BA82',
-    backgroundColor: '#214933',
+    backgroundColor: '#40504A',
   },
-  ongoingWorkoutText: { color: '#CFF3D9', fontWeight: '800', textAlign: 'center', fontSize: 14 },
+  ongoingWorkoutText: { color: '#FFFFFF', fontWeight: '700', textAlign: 'center', fontSize: 14 },
   trainingSectionTitle: { color: '#DCE4EC', fontSize: 16, fontWeight: '700', marginTop: 6 },
   historyHeaderRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginTop: 6 },
   historySelectionActions: { flexDirection: 'row', alignItems: 'center', gap: 8 },
@@ -3198,10 +5140,10 @@ const styles = StyleSheet.create({
   },
   historySelectedCard: { borderColor: '#7FC8FF', backgroundColor: '#1B2A38' },
   historyCardContent: { gap: 3 },
-  historyCardTitle: { color: '#EAF2FA', fontSize: 19, fontWeight: '800' },
-  historyCardDateTime: { color: '#B8C8D7', fontSize: 13, fontWeight: '600' },
-  historyCardDuration: { color: '#96ADC1', fontSize: 12, fontWeight: '600' },
-  historyDetailMeta: { color: '#A8BACB', fontSize: 12, marginTop: 4, textAlign: 'center' },
+  historyCardTitle: { color: '#FFFFFF', fontSize: 19, fontWeight: '800' },
+  historyCardDateTime: { color: '#FFFFFF', fontSize: 13, fontWeight: '600' },
+  historyCardDuration: { color: '#FFFFFF', fontSize: 12, fontWeight: '600' },
+  historyDetailMeta: { color: '#FFFFFF', fontSize: 12, marginTop: 4, textAlign: 'center' },
   historySetRow: {
     borderRadius: 8,
     borderWidth: 1,
@@ -3214,8 +5156,54 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
     gap: 10,
   },
-  historySetValue: { color: '#B9CAD9', fontSize: 13, fontWeight: '700' },
+  historySetValue: { color: '#FFFFFF', fontSize: 13, fontWeight: '700' },
   trainingSessionTop: { paddingHorizontal: 12, paddingTop: 10, paddingBottom: 6, minHeight: 46, justifyContent: 'center' },
+  trainingSessionTopRow: { minHeight: 38, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 8 },
+  trainingTopActionsRight: { minWidth: 86, flexDirection: 'row', justifyContent: 'flex-end', alignItems: 'center', gap: 6 },
+  trainingMiniButton: {
+    width: 34,
+    height: 34,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#3F5263',
+    backgroundColor: '#1A222C',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  trainingMiniPrimaryButton: {
+    width: 34,
+    height: 34,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#7FBF82',
+    backgroundColor: '#A5D6A7',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  trainingMiniDangerButton: {
+    width: 34,
+    height: 34,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#4B2E34',
+    backgroundColor: '#23181B',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  sessionAbortTopButton: {
+    position: 'absolute',
+    right: 12,
+    top: 8,
+    width: 34,
+    height: 34,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#4B2E34',
+    backgroundColor: '#23181B',
+    alignItems: 'center',
+    justifyContent: 'center',
+    zIndex: 2,
+  },
   trainingBackButton: { position: 'absolute', left: 12, top: 10, flexDirection: 'row', alignItems: 'center', gap: 4, zIndex: 5, elevation: 5 },
   sectionBackText: { color: '#DCE4EC', fontSize: 14, fontWeight: '600' },
   trainingTimer: { color: '#E3EAF2', fontSize: 24, fontWeight: '800', textAlign: 'center' },
@@ -3230,10 +5218,10 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     backgroundColor: '#101821',
   },
-  trainingStatButtonText: { color: '#DCE4EC', fontSize: 16, fontWeight: '700', marginTop: -1 },
+  trainingStatButtonText: { color: '#FFFFFF', fontSize: 16, fontWeight: '700', marginTop: -1 },
   trainingMeta: { color: '#A8BACB', fontSize: 13, marginTop: 2 },
   loggedSetList: { gap: 6, marginTop: 2 },
-  loggedSetEmpty: { color: '#8FA1B3', fontSize: 13 },
+  loggedSetEmpty: { color: '#FFFFFF', fontSize: 13 },
   loggedSetRow: {
     borderRadius: 8,
     borderWidth: 1,
@@ -3241,20 +5229,29 @@ const styles = StyleSheet.create({
     backgroundColor: '#16202B',
     paddingHorizontal: 10,
     paddingVertical: 7,
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    gap: 10,
+    gap: 8,
   },
-  loggedSetTitle: { color: '#DCE4EC', fontWeight: '700', minWidth: 48 },
+  loggedSetRowMain: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', gap: 10 },
+  loggedSetTitle: { color: '#FFFFFF', fontWeight: '700', minWidth: 48 },
   loggedSetMetrics: { alignItems: 'center', minWidth: 108 },
-  loggedSetMetricLabel: { color: '#8FA1B3', fontSize: 11, textTransform: 'uppercase' },
-  loggedSetMetricValue: { color: '#A8BACB', fontSize: 13, fontWeight: '700' },
+  loggedSetMetricLabel: { color: '#FFFFFF', fontSize: 11, textTransform: 'uppercase' },
+  loggedSetMetricValue: { color: '#FFFFFF', fontSize: 13, fontWeight: '700' },
+  pbFeedbackBox: {
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#3D8055',
+    backgroundColor: '#1B3A2A',
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+  },
+  pbFeedbackTitle: { color: '#D7F7E2', fontWeight: '800', fontSize: 13 },
   trainingBottomRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
   trainingLastLogged: { color: '#8FA1B3', fontSize: 12 },
-  trainingButtons: { flexDirection: 'row', gap: 8 },
+  trainingButtons: { flexDirection: 'row', gap: 8, marginTop: 12 },
+  savedPlanHeaderRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 },
   savedPlanActionsRow: { flexDirection: 'row', gap: 8, marginTop: 4 },
   savedPlanActionButton: { flex: 1 },
+  savedPlanStartButton: { marginTop: 12 },
   trainingBuilderRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
   sessionBottomActions: {
     marginHorizontal: 12,
@@ -3303,4 +5300,65 @@ const styles = StyleSheet.create({
   categoryBackdropTapZone: { ...StyleSheet.absoluteFillObject, zIndex: 1 },
   categoryEditorOverlay: { ...StyleSheet.absoluteFillObject, backgroundColor: 'rgba(0, 0, 0, 0.62)', justifyContent: 'center', paddingHorizontal: 18, zIndex: 50, elevation: 50 },
   categoryHintText: { color: '#9AAEC0', marginTop: 20, marginBottom: 2 },
+  categorySectionLabel: { color: '#9AAEC0', fontSize: 13, fontWeight: '600', marginTop: 14, marginBottom: 6 },
+  categoryChipSection: { marginBottom: 4 },
+  pbModalCard: { width: '100%', maxWidth: 520, maxHeight: '84%', alignSelf: 'center' },
+  pbModalHeader: { gap: 10, marginBottom: 8 },
+  pbList: { maxHeight: 360 },
+  pbRow: {
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#2C3A49',
+    backgroundColor: '#16202B',
+    paddingHorizontal: 10,
+    paddingVertical: 10,
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    gap: 10,
+    marginBottom: 6,
+  },
+  pbRowText: { color: '#DCE4EC', fontWeight: '700', fontSize: 13 },
+  pbRowDate: { color: '#9DB0C2', fontWeight: '600', fontSize: 12 },
+  pbSummaryCard: {
+    width: '100%',
+    maxWidth: 520,
+    maxHeight: '84%',
+    alignSelf: 'center',
+    paddingTop: 12,
+    backgroundColor: '#151D26',
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: '#24313E',
+  },
+  pbSummaryHeaderRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 10 },
+  pbSummaryTitle: { color: '#E3EAF2', fontSize: 20, fontWeight: '800' },
+  pbSummaryMeta: { color: '#A8BACB', fontSize: 12, fontWeight: '700', marginTop: 2 },
+  pbSummaryCloseButton: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: '#33414F',
+    backgroundColor: '#1A222C',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  pbSummaryList: { maxHeight: 420 },
+  pbSummaryRow: {
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#2C3A49',
+    backgroundColor: '#16202B',
+    paddingHorizontal: 10,
+    paddingVertical: 9,
+    marginBottom: 6,
+  },
+  pbSummaryExercise: { color: '#DCE4EC', fontWeight: '700', fontSize: 14 },
+  pbSummaryMainValue: { color: '#A8BACB', fontWeight: '700', fontSize: 13, marginTop: 2 },
+  pbSummarySubValue: { color: '#8FA1B3', fontWeight: '600', fontSize: 12, marginTop: 3 },
+  pbSummaryMoreText: { color: '#8FA1B3', fontSize: 12, textAlign: 'center', marginTop: 6 },
+  builderConfirmCard: { width: '100%', maxWidth: 520, alignSelf: 'center' },
+  builderConfirmSummary: { marginTop: 8, marginBottom: 16, paddingVertical: 10, paddingHorizontal: 8, backgroundColor: '#1A222C', borderRadius: 10, borderWidth: 1, borderColor: '#2B3A48' },
+  builderConfirmPlanName: { color: '#E3EAF2', fontSize: 16, fontWeight: '700', marginBottom: 10 },
+  builderConfirmExerciseRow: { color: '#A8BACB', fontSize: 14, marginTop: 4, lineHeight: 20 },
 });

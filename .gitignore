@@ -33,9 +33,20 @@ yarn-error.*
 # local env files
 .env*.local
 
+# wireless ADB config (local IP)
+scripts/.wireless-adb.json
+
 # typescript
 *.tsbuildinfo
 
 # generated native folders
 /ios
 /android
+
+# build artifacts & local data
+*.apk
+*.db
+storage/
+
+# native module build (long paths on Windows)
+modules/naphab-native-notifications/android/build/
