@@ -53,12 +53,43 @@ target 'TrackWell' do
   )
 
   post_install do |installer|
+    #region agent log
+    puts "[AGENT-DEBUG c5427d H7] Podfile post_install started"
+    privacy_manifest_path = File.expand_path('../node_modules/expo-application/ios/PrivacyInfo.xcprivacy', __dir__)
+    puts "[AGENT-DEBUG c5427d H7] Podfile post_install privacyManifestPath=#{privacy_manifest_path} exists=#{File.exist?(privacy_manifest_path)}"
+    #endregion
+
     react_native_post_install(
       installer,
       config[:reactNativePath],
       :mac_catalyst_enabled => false,
       :ccache_enabled => ccache_enabled?(podfile_properties),
     )
+
+    exapp_privacy_target = installer.pods_project.targets.find { |t| t.name == 'EXApplication-ExpoApplication_privacy' }
+    if exapp_privacy_target
+      debug_phase_name = '[AGENT-DEBUG] Check ExpoApplication privacy manifest'
+      unless exapp_privacy_target.shell_script_build_phases.any? { |phase| phase.name == debug_phase_name }
+        debug_phase = exapp_privacy_target.new_shell_script_build_phase(debug_phase_name)
+        debug_phase.shell_script = <<~SCRIPT
+          #region agent log
+          PRIV_PATH="${PODS_ROOT}/../node_modules/expo-application/ios/PrivacyInfo.xcprivacy"
+          PRIV_EXISTS=false
+          if [ -f "$PRIV_PATH" ]; then
+            PRIV_EXISTS=true
+          fi
+          echo "[AGENT-DEBUG c5427d H8] EXApplication-ExpoApplication_privacy sees privacyPath=$PRIV_PATH exists=$PRIV_EXISTS"
+          #endregion
+        SCRIPT
+      end
+      #region agent log
+      puts "[AGENT-DEBUG c5427d H8] Added/verified EXApplication-ExpoApplication_privacy debug build phase"
+      #endregion
+    else
+      #region agent log
+      puts "[AGENT-DEBUG c5427d H8] Could not find EXApplication-ExpoApplication_privacy target during post_install"
+      #endregion
+    end
 
     # react-native-slider currently includes a Fabric-only source file even when
     # the new architecture is disabled. Exclude it for legacy architecture builds.

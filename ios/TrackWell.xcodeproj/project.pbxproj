@@ -310,7 +310,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "# This script configures Expo modules and generates the modules provider file.\nbash -l -c \"./Pods/Target\\ Support\\ Files/Pods-TrackWell/expo-configure-project.sh\"\n";
+			shellScript = "#region agent log\nPRIV_PATH=\"$SRCROOT/../node_modules/expo-application/ios/PrivacyInfo.xcprivacy\"\nPRIV_EXISTS=false\nif [ -f \"$PRIV_PATH\" ]; then\n  PRIV_EXISTS=true\nfi\necho \"[AGENT-DEBUG c5427d H5] [Expo] Configure project sees privacyPath=$PRIV_PATH exists=$PRIV_EXISTS\"\n#endregion\n# This script configures Expo modules and generates the modules provider file.\nbash -l -c \"./Pods/Target\\ Support\\ Files/Pods-TrackWell/expo-configure-project.sh\"\n";
 		};
 		C6E1C25A134FB0C3A1E68DFF /* [CP] Embed Pods Frameworks */ = {
 			isa = PBXShellScriptBuildPhase;
