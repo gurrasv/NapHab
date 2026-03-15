@@ -40,7 +40,6 @@ scripts/.wireless-adb.json
 *.tsbuildinfo
 
 # generated native folders
-/ios
 /android
 
 # build artifacts & local data
