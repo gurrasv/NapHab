@@ -53,8 +53,13 @@ const WEEKDAY_KEY_TO_JS_DAY: Record<'mon' | 'tue' | 'wed' | 'thu' | 'fri' | 'sat
 
 const ALL_JS_DAYS = [0, 1, 2, 3, 4, 5, 6];
 
+function isEveryDayLabel(label: string): boolean {
+  const normalized = label.trim().toLowerCase();
+  return normalized === 'varje dag' || normalized === 'alla dagar';
+}
+
 function parseDaysLabelToJsDays(daysLabel: string): number[] {
-  if (daysLabel.trim().toLowerCase() === 'varje dag') return ALL_JS_DAYS;
+  if (isEveryDayLabel(daysLabel)) return ALL_JS_DAYS;
   return daysLabel
     .split(',')
     .map((label) => label.trim().toLowerCase())

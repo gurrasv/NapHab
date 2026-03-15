@@ -105,6 +105,7 @@ type PersistedState = {
   exerciseWeightPbs?: ExerciseWeightPb[];
   rehabLibraryExercises?: LibraryExercise[];
   gymLibraryExercises?: LibraryExercise[];
+  analysisBlocks?: AnalysisBlock[];
 };
 type DiaryViewMode = 'tim' | 'dag' | 'manad';
 type WeekdayKey = 'mon' | 'tue' | 'wed' | 'thu' | 'fri' | 'sat' | 'sun';
@@ -308,9 +309,14 @@ const IOS_ACTION_SNOOZE = 'trackwell.action.snooze';
 const IOS_SNOOZE_MINUTES = 10;
 const IOS_PENDING_COMPLETIONS_STORAGE_KEY = 'naphab_ios_pending_completions_v1';
 
+function isEveryDayLabel(label: string): boolean {
+  const normalized = label.trim().toLowerCase();
+  return normalized === 'varje dag' || normalized === 'alla dagar';
+}
+
 /** Parse the human-readable daysLabel back to JS day-of-week numbers (0 = Sun). */
 function parseDaysLabelToJsDays(daysLabel: string): number[] {
-  if (daysLabel === 'Varje dag') return [0, 1, 2, 3, 4, 5, 6];
+  if (isEveryDayLabel(daysLabel)) return [0, 1, 2, 3, 4, 5, 6];
   return daysLabel
     .split(',')
     .map((label) => label.trim().toLowerCase())
@@ -3927,6 +3933,8 @@ const describePieSlice = (cx: number, cy: number, radius: number, startAngle: nu
 function AnalysisScreen({
   exercises,
   logs,
+  analysisBlocks,
+  setAnalysisBlocks,
   completedWorkouts = [],
   workoutPlans = [],
   gymLibraryExercises = [],
@@ -3934,6 +3942,8 @@ function AnalysisScreen({
 }: {
   exercises: Exercise[];
   logs: ExerciseLog[];
+  analysisBlocks: AnalysisBlock[];
+  setAnalysisBlocks: React.Dispatch<React.SetStateAction<AnalysisBlock[]>>;
   completedWorkouts?: CompletedWorkout[];
   exerciseWeightPbs?: ExerciseWeightPb[];
   workoutPlans?: WorkoutPlan[];
@@ -3948,7 +3958,6 @@ function AnalysisScreen({
   const days = useMemo(() => buildTimelineDays(), []);
   const weeks = useMemo(() => buildTimelineWeeks(), []);
   const weekKeySet = useMemo(() => new Set(weeks.map((week) => week.key)), [weeks]);
-  const [analysisBlocks, setAnalysisBlocks] = useState<AnalysisBlock[]>([{ id: '1', type: 'rehabFrequency' }]);
   const [analysisPickerOpen, setAnalysisPickerOpen] = useState(false);
   const [progressionExercisePickerOpen, setProgressionExercisePickerOpen] = useState(false);
   const [progressionPickerTargetBlockId, setProgressionPickerTargetBlockId] = useState<string | null>(null);
@@ -5489,6 +5498,7 @@ export default function App() {
   const [exerciseWeightPbs, setExerciseWeightPbs] = useState<ExerciseWeightPb[]>([]);
   const [rehabLibraryExercises, setRehabLibraryExercises] = useState<LibraryExercise[]>(LIBRARY_EXERCISES);
   const [gymLibraryExercises, setGymLibraryExercises] = useState<LibraryExercise[]>(GYM_LIBRARY_EXERCISES);
+  const [analysisBlocks, setAnalysisBlocks] = useState<AnalysisBlock[]>([{ id: '1', type: 'rehabFrequency' }]);
   const [newSeriesDialog, setNewSeriesDialog] = useState(false);
   const [newSeriesName, setNewSeriesName] = useState('');
   const [libraryVisible, setLibraryVisible] = useState(false);
@@ -5548,6 +5558,7 @@ export default function App() {
           if (Array.isArray(parsed.exerciseWeightPbs)) setExerciseWeightPbs(parsed.exerciseWeightPbs);
           if (Array.isArray(parsed.rehabLibraryExercises)) setRehabLibraryExercises(parsed.rehabLibraryExercises);
           if (Array.isArray(parsed.gymLibraryExercises)) setGymLibraryExercises(mergeGymLibrary(parsed.gymLibraryExercises));
+          if (Array.isArray(parsed.analysisBlocks)) setAnalysisBlocks(parsed.analysisBlocks);
         }
         // Re-read logs from storage in case background actions wrote new logs.
         try {
@@ -5579,11 +5590,12 @@ export default function App() {
       exerciseWeightPbs,
       rehabLibraryExercises,
       gymLibraryExercises,
+      analysisBlocks,
     };
     AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(payload)).catch(() => {
       // Ignore temporary storage failures.
     });
-  }, [exercises, logs, painSeries, workoutPlans, completedWorkouts, exerciseWeightPbs, rehabLibraryExercises, gymLibraryExercises, isHydrated]);
+  }, [exercises, logs, painSeries, workoutPlans, completedWorkouts, exerciseWeightPbs, rehabLibraryExercises, gymLibraryExercises, analysisBlocks, isHydrated]);
 
   /* ── Deep link import handler ── */
   const pendingDeepLinkRef = useRef<string | null>(null);
@@ -5611,12 +5623,13 @@ export default function App() {
       // Short keys: t=title, l=libraryExerciseId(ignored—title already set), d=description,
       //             c=color, dl=daysLabel, s=sets, r=reps, tm=times, ro=remindersOn(0/1)
       function expandExercise(raw: Record<string, unknown>): Exercise {
+        const rawDaysLabel = ((raw.dl || raw.daysLabel || 'Varje dag') as string).trim();
         return {
           id: `ex_${makeId()}`,
           title: (raw.t || raw.title || '') as string,
           description: (raw.d || raw.description || '') as string,
           color: (raw.c || raw.color || '#5E81AC') as string,
-          daysLabel: (raw.dl || raw.daysLabel || 'Alla dagar') as string,
+          daysLabel: isEveryDayLabel(rawDaysLabel) ? 'Varje dag' : rawDaysLabel,
           sets: (raw.s ?? raw.sets ?? 3) as number,
           reps: (raw.r ?? raw.reps ?? 10) as number,
           times: (raw.tm || raw.times || []) as string[],
@@ -6207,6 +6220,8 @@ export default function App() {
                     <AnalysisScreen
                       exercises={exercises}
                       logs={logs}
+                      analysisBlocks={analysisBlocks}
+                      setAnalysisBlocks={setAnalysisBlocks}
                       completedWorkouts={completedWorkouts}
                       exerciseWeightPbs={exerciseWeightPbs}
                       workoutPlans={workoutPlans}
