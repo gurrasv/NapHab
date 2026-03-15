@@ -30697,6 +30697,7 @@
 			buildConfigurationList = 46EB2E00018900 /* Build configuration list for PBXNativeTarget "RCTDeprecation" */;
 			buildPhases = (
 				46EB2E00018940 /* Headers */,
+				46EB2E00B1D003 /* [AGENT-DEBUG] Ensure RCTDeprecation source */,
 				46EB2E00018950 /* Sources */,
 				46EB2E00018960 /* Frameworks */,
 			);
@@ -32907,6 +32908,24 @@
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXShellScriptBuildPhase section */
+		46EB2E00B1D003 /* [AGENT-DEBUG] Ensure RCTDeprecation source */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "[AGENT-DEBUG] Ensure RCTDeprecation source";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "#region agent log\nREPO_ROOT=\"${PODS_ROOT}/../..\"\nSRC_PATH=\"${REPO_ROOT}/node_modules/react-native/ReactApple/Libraries/RCTFoundation/RCTDeprecation/RCTDeprecation.m\"\nSRC_DIR=\"$(dirname \"$SRC_PATH\")\"\nFALLBACK_DIR=\"${REPO_ROOT}/ios/RCTDeprecationFallback\"\nFALLBACK_PATH=\"${FALLBACK_DIR}/RCTDeprecation.m\"\nLOG_PATH=\"/Users/rentamac/Documents/.cursor/debug-c5427d.log\"\nRUN_ID=\"xcode-cloud-rctdeprecation\"\n\nemit_debug_json() {\n  payload=\"$1\"\n  if [ -n \"$payload\" ]; then\n    printf '%s\\n' \"$payload\" >> \"$LOG_PATH\" 2>/dev/null || true\n  fi\n}\n\necho \"[AGENT-DEBUG c5427d H13] resolvedPaths repoRoot=$REPO_ROOT sourcePath=$SRC_PATH fallbackPath=$FALLBACK_PATH\"\nemit_debug_json \"{\\\"sessionId\\\":\\\"c5427d\\\",\\\"runId\\\":\\\"$RUN_ID\\\",\\\"hypothesisId\\\":\\\"H13\\\",\\\"location\\\":\\\"Pods.xcodeproj:RCTDeprecation-precheck\\\",\\\"message\\\":\\\"Resolved RCTDeprecation source paths\\\",\\\"data\\\":{\\\"sourcePath\\\":\\\"$SRC_PATH\\\",\\\"fallbackPath\\\":\\\"$FALLBACK_PATH\\\"},\\\"timestamp\\\":$(date +%s)000}\"\n\nif [ -f \"$SRC_PATH\" ]; then\n  SRC_SIZE=$(wc -c < \"$SRC_PATH\" 2>/dev/null || echo 0)\n  echo \"[AGENT-DEBUG c5427d H14] precheck sourceExists=true sizeBytes=$SRC_SIZE path=$SRC_PATH\"\n  emit_debug_json \"{\\\"sessionId\\\":\\\"c5427d\\\",\\\"runId\\\":\\\"$RUN_ID\\\",\\\"hypothesisId\\\":\\\"H14\\\",\\\"location\\\":\\\"Pods.xcodeproj:RCTDeprecation-precheck\\\",\\\"message\\\":\\\"RCTDeprecation source exists before build\\\",\\\"data\\\":{\\\"exists\\\":true,\\\"sizeBytes\\\":$SRC_SIZE},\\\"timestamp\\\":$(date +%s)000}\"\nelse\n  echo \"[AGENT-DEBUG c5427d H14] precheck sourceExists=false path=$SRC_PATH\"\n  emit_debug_json \"{\\\"sessionId\\\":\\\"c5427d\\\",\\\"runId\\\":\\\"$RUN_ID\\\",\\\"hypothesisId\\\":\\\"H14\\\",\\\"location\\\":\\\"Pods.xcodeproj:RCTDeprecation-precheck\\\",\\\"message\\\":\\\"RCTDeprecation source missing before build\\\",\\\"data\\\":{\\\"exists\\\":false},\\\"timestamp\\\":$(date +%s)000}\"\n\n  if [ -f \"$FALLBACK_PATH\" ]; then\n    mkdir -p \"$SRC_DIR\"\n    cp \"$FALLBACK_PATH\" \"$SRC_PATH\"\n    echo \"[AGENT-DEBUG c5427d H15] restoredSourceFromFallback=true\"\n    emit_debug_json \"{\\\"sessionId\\\":\\\"c5427d\\\",\\\"runId\\\":\\\"$RUN_ID\\\",\\\"hypothesisId\\\":\\\"H15\\\",\\\"location\\\":\\\"Pods.xcodeproj:RCTDeprecation-restore\\\",\\\"message\\\":\\\"Restored RCTDeprecation source from fallback\\\",\\\"data\\\":{\\\"restored\\\":true},\\\"timestamp\\\":$(date +%s)000}\"\n  else\n    echo \"[AGENT-DEBUG c5427d H15] restoredSourceFromFallback=false reason=fallback_missing\"\n    emit_debug_json \"{\\\"sessionId\\\":\\\"c5427d\\\",\\\"runId\\\":\\\"$RUN_ID\\\",\\\"hypothesisId\\\":\\\"H15\\\",\\\"location\\\":\\\"Pods.xcodeproj:RCTDeprecation-restore\\\",\\\"message\\\":\\\"Fallback source missing\\\",\\\"data\\\":{\\\"restored\\\":false,\\\"reason\\\":\\\"fallback_missing\\\"},\\\"timestamp\\\":$(date +%s)000}\"\n  fi\nfi\n\nif [ -f \"$SRC_PATH\" ]; then\n  SRC_SIZE=$(wc -c < \"$SRC_PATH\" 2>/dev/null || echo 0)\n  echo \"[AGENT-DEBUG c5427d H16] postcheck sourceExists=true sizeBytes=$SRC_SIZE path=$SRC_PATH\"\n  emit_debug_json \"{\\\"sessionId\\\":\\\"c5427d\\\",\\\"runId\\\":\\\"$RUN_ID\\\",\\\"hypothesisId\\\":\\\"H16\\\",\\\"location\\\":\\\"Pods.xcodeproj:RCTDeprecation-postcheck\\\",\\\"message\\\":\\\"RCTDeprecation source exists after restoration attempt\\\",\\\"data\\\":{\\\"exists\\\":true,\\\"sizeBytes\\\":$SRC_SIZE},\\\"timestamp\\\":$(date +%s)000}\"\nelse\n  echo \"[AGENT-DEBUG c5427d H16] postcheck sourceExists=false path=$SRC_PATH\"\n  emit_debug_json \"{\\\"sessionId\\\":\\\"c5427d\\\",\\\"runId\\\":\\\"$RUN_ID\\\",\\\"hypothesisId\\\":\\\"H16\\\",\\\"location\\\":\\\"Pods.xcodeproj:RCTDeprecation-postcheck\\\",\\\"message\\\":\\\"RCTDeprecation source still missing after restoration attempt\\\",\\\"data\\\":{\\\"exists\\\":false},\\\"timestamp\\\":$(date +%s)000}\"\n  exit 1\nfi\n\nif [ -d \"$SRC_DIR\" ]; then\n  SRC_LISTING_COUNT=$(ls -1 \"$SRC_DIR\" 2>/dev/null | wc -l | tr -d ' ')\n  echo \"[AGENT-DEBUG c5427d H17] sourceDirExists=true fileCount=$SRC_LISTING_COUNT path=$SRC_DIR\"\n  emit_debug_json \"{\\\"sessionId\\\":\\\"c5427d\\\",\\\"runId\\\":\\\"$RUN_ID\\\",\\\"hypothesisId\\\":\\\"H17\\\",\\\"location\\\":\\\"Pods.xcodeproj:RCTDeprecation-dircheck\\\",\\\"message\\\":\\\"RCTDeprecation source directory exists\\\",\\\"data\\\":{\\\"dirExists\\\":true,\\\"fileCount\\\":$SRC_LISTING_COUNT},\\\"timestamp\\\":$(date +%s)000}\"\nelse\n  echo \"[AGENT-DEBUG c5427d H17] sourceDirExists=false path=$SRC_DIR\"\n  emit_debug_json \"{\\\"sessionId\\\":\\\"c5427d\\\",\\\"runId\\\":\\\"$RUN_ID\\\",\\\"hypothesisId\\\":\\\"H17\\\",\\\"location\\\":\\\"Pods.xcodeproj:RCTDeprecation-dircheck\\\",\\\"message\\\":\\\"RCTDeprecation source directory missing\\\",\\\"data\\\":{\\\"dirExists\\\":false},\\\"timestamp\\\":$(date +%s)000}\"\nfi\n#endregion\n";
+		};
 		46EB2E00A0C542 /* [AGENT-DEBUG] Ensure node_modules privacy manifest */ = {
 			isa = PBXShellScriptBuildPhase;
 			buildActionMask = 2147483647;
