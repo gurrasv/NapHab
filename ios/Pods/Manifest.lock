@@ -2046,7 +2046,7 @@ PODS:
     - SocketRocket
   - react-native-safe-area-context (5.6.2):
     - React-Core
-  - react-native-slider (5.0.1):
+  - react-native-slider (5.1.2):
     - boost
     - DoubleConversion
     - fast_float
@@ -3016,7 +3016,7 @@ SPEC CHECKSUMS:
   React-Mapbuffer: b586f547cd5631696243760d9591b975596a5990
   React-microtasksnativemodule: 55f4c45b6319f7af1955a5dc7621eaf31bd114ce
   react-native-safe-area-context: e48706fb09fde89f82e12bfb49b140cfdcb761f7
-  react-native-slider: 9bf0df53dabf5ab1a7cb98149f9d492d9693666d
+  react-native-slider: fc0f08f7b5d6e1f73d808afe6bc40ff21e3bf4d0
   React-NativeModulesApple: 5497ff3f4ab94454a3aee13e94f3f5f07cc5f70a
   React-oscompat: eb0626e8ba1a2c61673c991bf9dc21834898475d
   React-perflogger: d0d0d1b884120fa0a13bd38ac5e9c3c8e8bfe82a
@@ -3055,6 +3055,6 @@ SPEC CHECKSUMS:
   SocketRocket: d4aabe649be1e368d1318fdf28a022d714d65748
   Yoga: 728df40394d49f3f471688747cf558158b3a3bd1
 
-PODFILE CHECKSUM: a33dd8c749d205f6ede3742689914c1d4b5e8aac
+PODFILE CHECKSUM: 2f5cc95966726d0540f690bbd2aca1ff7aa03ba1
 
 COCOAPODS: 1.16.2

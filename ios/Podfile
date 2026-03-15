@@ -59,5 +59,25 @@ target 'TrackWell' do
       :mac_catalyst_enabled => false,
       :ccache_enabled => ccache_enabled?(podfile_properties),
     )
+
+    # react-native-slider currently includes a Fabric-only source file even when
+    # the new architecture is disabled. Exclude it for legacy architecture builds.
+    if ENV['RCT_NEW_ARCH_ENABLED'] == '0'
+      installer.pods_project.targets.each do |target|
+        next unless target.name == 'react-native-slider'
+
+        target.build_configurations.each do |build_config|
+          existing = build_config.build_settings['EXCLUDED_SOURCE_FILE_NAMES']
+          existing_str = existing.is_a?(Array) ? existing.join(' ') : existing.to_s
+          unless existing_str.include?('RNCSliderComponentView.mm')
+            value = ['$(inherited)', existing_str, 'RNCSliderComponentView.mm']
+              .map(&:to_s)
+              .reject(&:empty?)
+              .join(' ')
+            build_config.build_settings['EXCLUDED_SOURCE_FILE_NAMES'] = value
+          end
+        end
+      end
+    end
   end
 end
