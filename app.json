@@ -14,7 +14,11 @@
       "backgroundColor": "#ffffff"
     },
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "bundleIdentifier": "com.gurrasv.naphabapp",
+      "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false
+      }
     },
     "android": {
       "adaptiveIcon": {
@@ -34,15 +38,16 @@
     },
     "plugins": [
       "./plugins/withNativeAndroidNotifications",
+      "expo-notifications",
       "expo-font",
       "@react-native-community/datetimepicker"
     ],
     "extra": {
       "appVariant": "preview",
       "eas": {
-        "projectId": "20130e2c-33c9-48f9-9c4e-f19897eae875"
+        "projectId": "ece6c3f6-9eb8-4ee7-9695-9c50b6bde252"
       }
     },
-    "owner": "cardistrygurra"
+    "owner": "gurrasv"
   }
 }

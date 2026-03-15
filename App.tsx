@@ -10,6 +10,7 @@ import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Gesture, GestureDetector, GestureHandlerRootView, ScrollView, Swipeable } from 'react-native-gesture-handler';
 import * as Device from 'expo-device';
+import * as Notifications from 'expo-notifications';
 import {
   consumeAndroidPendingCompletions,
   dismissAndroidWorkoutNotification,
@@ -28,6 +29,7 @@ import {
   Dimensions,
   Easing,
   FlatList,
+  LayoutAnimation,
   Modal,
   PanResponder,
   Platform,
@@ -37,10 +39,20 @@ import {
   Switch,
   Text,
   TextInput,
+  UIManager,
   View,
 } from 'react-native';
 import { Button, Checkbox, Dialog, MD3DarkTheme, Portal, Provider as PaperProvider } from 'react-native-paper';
 import Svg, { Circle, Line, Path, Rect } from 'react-native-svg';
+
+Notifications.setNotificationHandler({
+  handleNotification: async () => ({
+    shouldShowBanner: true,
+    shouldShowList: true,
+    shouldPlaySound: true,
+    shouldSetBadge: false,
+  }),
+});
 
 type Exercise = {
   id: string;
@@ -56,6 +68,7 @@ type Exercise = {
 };
 
 type ExerciseLog = { exerciseId: string; atIso: string };
+type PendingCompletionItem = { exerciseId: string; atIso: string };
 type PainEntry = { id: string; atIso: string; value: number; note: string };
 type PainSeries = { id: string; name: string; value: number; draftNote: string; entries: PainEntry[] };
 type SessionSet = { id: string; reps: number; weightKg: number };
@@ -111,6 +124,7 @@ const TAB_SWIPE_DISTANCE_RATIO = 0.05;
 const APP_BG_COLOR = '#0F1419';
 const CARD_TRANSITION_CORNER_RADIUS = 16;
 const MIN_CARD_TRANSITION_SCALE = 0.2;
+const TITLE_FADE_SCROLL_DISTANCE = 70;
 
 function AnimatedTabScreen({ children }: { children: React.ReactNode }) {
   const { direction, clearDirection } = useContext(TabTransitionContext);
@@ -198,6 +212,82 @@ const WEEKDAY_KEY_BY_JS_DAY: Record<number, WeekdayKey> = {
 const toWeightKey = (weightKg: number): number => Math.round(weightKg * WEIGHT_KEY_FACTOR);
 const weightKeyToKg = (weightKey: number): number => weightKey / WEIGHT_KEY_FACTOR;
 const formatWeightKg = (weightKg: number): string => (Number.isInteger(weightKg) ? `${weightKg}` : weightKg.toFixed(1));
+const clampNumber = (value: number, min: number, max: number): number => Math.min(max, Math.max(min, value));
+const sanitizeNumericInput = (text: string, allowDecimal: boolean): string => {
+  const normalized = text.replace(',', '.');
+  const filtered = allowDecimal ? normalized.replace(/[^0-9.]/g, '') : normalized.replace(/[^0-9]/g, '');
+  if (!allowDecimal) return filtered;
+  const [head, ...tail] = filtered.split('.');
+  return tail.length > 0 ? `${head}.${tail.join('')}` : head;
+};
+const formatNumericInputValue = (value: number, allowDecimal: boolean): string => {
+  if (value <= 0) return '';
+  return allowDecimal ? formatWeightKg(value) : `${Math.round(value)}`;
+};
+
+function NumericStepperInput({
+  value,
+  onChangeValue,
+  min,
+  max,
+  allowDecimal = false,
+  accessibilityLabel,
+}: {
+  value: number;
+  onChangeValue: (value: number) => void;
+  min: number;
+  max: number;
+  allowDecimal?: boolean;
+  accessibilityLabel: string;
+}) {
+  const [draft, setDraft] = useState(formatNumericInputValue(value, allowDecimal));
+  const [isFocused, setIsFocused] = useState(false);
+
+  useEffect(() => {
+    if (!isFocused) setDraft(formatNumericInputValue(value, allowDecimal));
+  }, [allowDecimal, isFocused, value]);
+
+  const normalizeValue = useCallback((nextValue: number) => {
+    const stepped = allowDecimal ? Math.round(nextValue * WEIGHT_KEY_FACTOR) / WEIGHT_KEY_FACTOR : Math.round(nextValue);
+    return clampNumber(stepped, min, max);
+  }, [allowDecimal, max, min]);
+
+  const commitDraft = useCallback((nextDraft: string) => {
+    const sanitized = sanitizeNumericInput(nextDraft, allowDecimal);
+    if (!sanitized || sanitized === '.') {
+      onChangeValue(0);
+      setDraft('');
+      return;
+    }
+    const parsed = Number(sanitized);
+    if (!Number.isFinite(parsed)) {
+      setDraft(formatNumericInputValue(value, allowDecimal));
+      return;
+    }
+    const normalized = normalizeValue(parsed);
+    onChangeValue(normalized);
+    setDraft(formatNumericInputValue(normalized, allowDecimal));
+  }, [allowDecimal, normalizeValue, onChangeValue, value]);
+
+  return (
+    <View style={styles.trainingStatActions}>
+      <TextInput
+        value={draft}
+        onChangeText={(text) => setDraft(sanitizeNumericInput(text, allowDecimal))}
+        onFocus={() => setIsFocused(true)}
+        onBlur={() => {
+          setIsFocused(false);
+          commitDraft(draft);
+        }}
+        onSubmitEditing={() => commitDraft(draft)}
+        keyboardType={allowDecimal ? 'decimal-pad' : 'number-pad'}
+        selectTextOnFocus
+        style={styles.trainingStatInput}
+        accessibilityLabel={accessibilityLabel}
+      />
+    </View>
+  );
+}
 const dominatesPbPoint = (
   a: { weightKey: number; bestReps: number },
   b: { weightKey: number; bestReps: number },
@@ -212,6 +302,11 @@ const pruneDominatedPbRows = <T extends { weightKey: number; bestReps: number }>
 const WEEKDAY_KEY_TO_JS_DAY: Record<WeekdayKey, number> = {
   sun: 0, mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6,
 };
+const IOS_REMINDER_CATEGORY_ID = 'trackwell.exercise.reminder';
+const IOS_ACTION_MARK_DONE = 'trackwell.action.done';
+const IOS_ACTION_SNOOZE = 'trackwell.action.snooze';
+const IOS_SNOOZE_MINUTES = 10;
+const IOS_PENDING_COMPLETIONS_STORAGE_KEY = 'naphab_ios_pending_completions_v1';
 
 /** Parse the human-readable daysLabel back to JS day-of-week numbers (0 = Sun). */
 function parseDaysLabelToJsDays(daysLabel: string): number[] {
@@ -241,6 +336,139 @@ function mergeLogs(base: ExerciseLog[], incoming: ExerciseLog[]): ExerciseLog[] 
   return out;
 }
 
+async function requestIosNotificationPermission(): Promise<boolean> {
+  if (Platform.OS !== 'ios') return true;
+  const current = await Notifications.getPermissionsAsync();
+  if (current.granted) return true;
+  const next = await Notifications.requestPermissionsAsync({
+    ios: {
+      allowAlert: true,
+      allowBadge: true,
+      allowSound: true,
+    },
+  });
+  return next.granted;
+}
+
+async function ensureIosNotificationCategoryConfigured(): Promise<void> {
+  if (Platform.OS !== 'ios') return;
+  await Notifications.setNotificationCategoryAsync(
+    IOS_REMINDER_CATEGORY_ID,
+    [
+      {
+        identifier: IOS_ACTION_MARK_DONE,
+        buttonTitle: 'Klar',
+      },
+      {
+        identifier: IOS_ACTION_SNOOZE,
+        buttonTitle: `Snooza ${IOS_SNOOZE_MINUTES} min`,
+      },
+    ],
+  );
+}
+
+async function appendIosPendingCompletion(completion: PendingCompletionItem): Promise<void> {
+  if (Platform.OS !== 'ios') return;
+  try {
+    const raw = await AsyncStorage.getItem(IOS_PENDING_COMPLETIONS_STORAGE_KEY);
+    const current = raw ? JSON.parse(raw) as PendingCompletionItem[] : [];
+    const list = Array.isArray(current) ? current : [];
+    const key = `${completion.exerciseId}|${completion.atIso}`;
+    if (list.some((row) => `${row.exerciseId}|${row.atIso}` === key)) return;
+    await AsyncStorage.setItem(
+      IOS_PENDING_COMPLETIONS_STORAGE_KEY,
+      JSON.stringify([...list, completion]),
+    );
+  } catch {
+    // Ignore persistence failures for pending actions.
+  }
+}
+
+async function consumeIosPendingCompletions(): Promise<PendingCompletionItem[]> {
+  if (Platform.OS !== 'ios') return [];
+  try {
+    const raw = await AsyncStorage.getItem(IOS_PENDING_COMPLETIONS_STORAGE_KEY);
+    await AsyncStorage.removeItem(IOS_PENDING_COMPLETIONS_STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) as PendingCompletionItem[] : [];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function extractNotificationDataValue(
+  data: Record<string, unknown> | undefined,
+  key: string,
+): string {
+  const value = data?.[key];
+  return typeof value === 'string' ? value : '';
+}
+
+function extractNotificationDataNumber(
+  data: Record<string, unknown> | undefined,
+  key: string,
+  fallback = 0,
+): number {
+  const value = data?.[key];
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string') {
+    const num = Number(value);
+    if (Number.isFinite(num)) return num;
+  }
+  return fallback;
+}
+
+async function handleIosNotificationResponse(
+  response: Notifications.NotificationResponse,
+): Promise<void> {
+  if (Platform.OS !== 'ios') return;
+  const action = response.actionIdentifier;
+  if (action !== IOS_ACTION_MARK_DONE && action !== IOS_ACTION_SNOOZE) {
+    return;
+  }
+
+  const content = response.notification.request.content;
+  const data = (content.data ?? {}) as Record<string, unknown>;
+  const exerciseId = extractNotificationDataValue(data, 'exerciseId');
+  if (!exerciseId) return;
+
+  if (action === IOS_ACTION_MARK_DONE) {
+    await appendIosPendingCompletion({
+      exerciseId,
+      atIso: new Date().toISOString(),
+    });
+    return;
+  }
+
+  if (action === IOS_ACTION_SNOOZE) {
+    await ensureIosNotificationCategoryConfigured();
+    const title = content.title || 'Övning';
+    const sets = extractNotificationDataNumber(data, 'sets', 0);
+    const reps = extractNotificationDataNumber(data, 'reps', 0);
+    const scheduleId = extractNotificationDataValue(data, 'scheduleId');
+    const triggerAt = new Date(Date.now() + IOS_SNOOZE_MINUTES * 60 * 1000);
+    await Notifications.scheduleNotificationAsync({
+      content: {
+        title,
+        body: `${sets} x ${reps}`,
+        sound: true,
+        categoryIdentifier: IOS_REMINDER_CATEGORY_ID,
+        data: {
+          exerciseId,
+          scheduleId: scheduleId ? `${scheduleId}-snooze-${triggerAt.getTime()}` : `snooze-${exerciseId}-${triggerAt.getTime()}`,
+          scheduledAtIso: triggerAt.toISOString(),
+          sets,
+          reps,
+        },
+      },
+      trigger: {
+        type: Notifications.SchedulableTriggerInputTypes.DATE,
+        date: triggerAt,
+      },
+    });
+  }
+}
+
 async function scheduleExerciseNotifications(
   exercises: Exercise[],
 ): Promise<void> {
@@ -251,24 +479,52 @@ async function scheduleExerciseNotifications(
     now,
     windowDays: 30,
   });
+  if (Platform.OS === 'android') {
+    const notificationPermissionGranted = await requestAndroidNotificationPermission();
+    if (!notificationPermissionGranted) return;
+    // Even without exact alarm permission we still schedule with inexact fallback in native layer.
+    await ensureAndroidExactAlarmPermission();
 
-  if (Platform.OS !== 'android') return;
+    const payloads: AndroidNotificationSchedule[] = candidates.map(({ exerciseId, title, sets, reps, scheduledTime, scheduleId }) => ({
+      exerciseId,
+      title,
+      sets,
+      reps,
+      scheduledAtIso: scheduledTime.toISOString(),
+      scheduleId,
+    }));
+    // Native side performs cancel + replace atomically, including clearing all when payloads is empty.
+    await scheduleAndroidNotifications(payloads);
+    return;
+  }
+  if (Platform.OS !== 'ios') return;
 
-  const notificationPermissionGranted = await requestAndroidNotificationPermission();
-  if (!notificationPermissionGranted) return;
-  // Even without exact alarm permission we still schedule with inexact fallback in native layer.
-  await ensureAndroidExactAlarmPermission();
+  const granted = await requestIosNotificationPermission();
+  if (!granted) return;
+  await ensureIosNotificationCategoryConfigured();
 
-  const payloads: AndroidNotificationSchedule[] = candidates.map(({ exerciseId, title, sets, reps, scheduledTime, scheduleId }) => ({
-    exerciseId,
-    title,
-    sets,
-    reps,
-    scheduledAtIso: scheduledTime.toISOString(),
-    scheduleId,
-  }));
-  // Native side performs cancel + replace atomically, including clearing all when payloads is empty.
-  await scheduleAndroidNotifications(payloads);
+  await Notifications.cancelAllScheduledNotificationsAsync();
+  for (const candidate of candidates) {
+    await Notifications.scheduleNotificationAsync({
+      content: {
+        title: candidate.title,
+        body: `${candidate.sets} x ${candidate.reps}`,
+        sound: true,
+        categoryIdentifier: IOS_REMINDER_CATEGORY_ID,
+        data: {
+          exerciseId: candidate.exerciseId,
+          scheduleId: candidate.scheduleId,
+          scheduledAtIso: candidate.scheduledTime.toISOString(),
+          sets: candidate.sets,
+          reps: candidate.reps,
+        },
+      },
+      trigger: {
+        type: Notifications.SchedulableTriggerInputTypes.DATE,
+        date: candidate.scheduledTime,
+      },
+    });
+  }
 }
 
 const LIBRARY_EXERCISES: LibraryExercise[] = [
@@ -448,6 +704,12 @@ function HomeScreen({
   const insets = useSafeAreaInsets();
   const swipeableRefs = useRef(new Map<string, Swipeable | null>());
   const openSwipeIdRef = useRef<string | null>(null);
+  const scrollY = useRef(new Animated.Value(0)).current;
+  const titleOpacity = scrollY.interpolate({
+    inputRange: [0, TITLE_FADE_SCROLL_DISTANCE],
+    outputRange: [1, 0],
+    extrapolate: 'clamp',
+  });
 
   const updateExercise = (id: string, patch: Partial<Exercise>) =>
     setExercises((prev) => prev.map((exercise) => (exercise.id === id ? { ...exercise, ...patch } : exercise)));
@@ -483,80 +745,153 @@ function HomeScreen({
 
   const runMinimalTriggerTest = async () => {
     try {
-      if (!(await requestAndroidNotificationPermission())) {
-        Alert.alert('Test misslyckades', 'Notisbehörighet nekad.');
+      if (Platform.OS === 'android') {
+        if (!(await requestAndroidNotificationPermission())) {
+          Alert.alert('Test misslyckades', 'Notisbehörighet nekad.');
+          return;
+        }
+        if (!(await ensureAndroidExactAlarmPermission())) return;
+        const triggerAt = new Date(Date.now() + 60 * 1000);
+        const count = await scheduleAndroidNotifications([
+          {
+            exerciseId: 'manual-test',
+            title: 'Manuell testövning',
+            sets: 1,
+            reps: 1,
+            scheduledAtIso: triggerAt.toISOString(),
+            scheduleId: `manual-test-${triggerAt.getTime()}`,
+          },
+        ]);
+        Alert.alert(
+          'Android native test schemalagd',
+          `Notis om ca 60 sek.\nSchemalagda poster: ${count}`,
+        );
         return;
       }
-      if (!(await ensureAndroidExactAlarmPermission())) return;
-      const triggerAt = new Date(Date.now() + 60 * 1000);
-      const count = await scheduleAndroidNotifications([
-        {
-          exerciseId: 'manual-test',
-          title: 'Manuell testövning',
-          sets: 1,
-          reps: 1,
-          scheduledAtIso: triggerAt.toISOString(),
-          scheduleId: `manual-test-${triggerAt.getTime()}`,
-        },
-      ]);
-      Alert.alert(
-        'Android native test schemalagd',
-        `Notis om ca 60 sek.\nSchemalagda poster: ${count}`,
-      );
+      if (Platform.OS === 'ios') {
+        if (!(await requestIosNotificationPermission())) {
+          Alert.alert('Test misslyckades', 'Notisbehörighet nekad.');
+          return;
+        }
+        await ensureIosNotificationCategoryConfigured();
+        const triggerAt = new Date(Date.now() + 60 * 1000);
+        await Notifications.scheduleNotificationAsync({
+          content: {
+            title: 'Manuell testövning',
+            body: '1 x 1',
+            sound: true,
+            categoryIdentifier: IOS_REMINDER_CATEGORY_ID,
+            data: {
+              exerciseId: 'manual-test-ios',
+              scheduleId: `manual-test-ios-${triggerAt.getTime()}`,
+              scheduledAtIso: triggerAt.toISOString(),
+              sets: 1,
+              reps: 1,
+            },
+          },
+          trigger: {
+            type: Notifications.SchedulableTriggerInputTypes.DATE,
+            date: triggerAt,
+          },
+        });
+        Alert.alert('iOS test schemalagd', 'Notis om ca 60 sek.');
+      }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      Alert.alert('Test misslyckades', `Android native test felade: ${msg}`);
+      Alert.alert('Test misslyckades', `Notistest felade: ${msg}`);
     }
   };
 
   const runInstantNotificationTest = async () => {
     try {
-      if (!(await requestAndroidNotificationPermission())) {
-        Alert.alert('Test misslyckades', 'Notisbehörighet nekad.');
+      if (Platform.OS === 'android') {
+        if (!(await requestAndroidNotificationPermission())) {
+          Alert.alert('Test misslyckades', 'Notisbehörighet nekad.');
+          return;
+        }
+        if (!(await ensureAndroidExactAlarmPermission())) return;
+        const triggerAt = new Date(Date.now() + 5 * 1000);
+        const count = await scheduleAndroidNotifications([
+          {
+            exerciseId: 'manual-test-now',
+            title: 'Manuell testövning',
+            sets: 1,
+            reps: 1,
+            scheduledAtIso: triggerAt.toISOString(),
+            scheduleId: `manual-now-${triggerAt.getTime()}`,
+          },
+        ]);
+        Alert.alert(
+          'Android native test (snabb)',
+          `Notis om ca 5 sek.\nSchemalagda poster: ${count}`,
+        );
         return;
       }
-      if (!(await ensureAndroidExactAlarmPermission())) return;
-      const triggerAt = new Date(Date.now() + 5 * 1000);
-      const count = await scheduleAndroidNotifications([
-        {
-          exerciseId: 'manual-test-now',
-          title: 'Manuell testövning',
-          sets: 1,
-          reps: 1,
-          scheduledAtIso: triggerAt.toISOString(),
-          scheduleId: `manual-now-${triggerAt.getTime()}`,
-        },
-      ]);
-      Alert.alert(
-        'Android native test (snabb)',
-        `Notis om ca 5 sek.\nSchemalagda poster: ${count}`,
-      );
+      if (Platform.OS === 'ios') {
+        if (!(await requestIosNotificationPermission())) {
+          Alert.alert('Test misslyckades', 'Notisbehörighet nekad.');
+          return;
+        }
+        await ensureIosNotificationCategoryConfigured();
+        const triggerAt = new Date(Date.now() + 3 * 1000);
+        await Notifications.scheduleNotificationAsync({
+          content: {
+            title: 'Manuell testövning',
+            body: '1 x 1',
+            sound: true,
+            categoryIdentifier: IOS_REMINDER_CATEGORY_ID,
+            data: {
+              exerciseId: 'manual-test-now-ios',
+              scheduleId: `manual-now-ios-${triggerAt.getTime()}`,
+              scheduledAtIso: triggerAt.toISOString(),
+              sets: 1,
+              reps: 1,
+            },
+          },
+          trigger: {
+            type: Notifications.SchedulableTriggerInputTypes.DATE,
+            date: triggerAt,
+          },
+        });
+        Alert.alert('iOS test (snabb)', 'Notis om ca 3 sek.');
+      }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      Alert.alert('Test misslyckades', `Android native test felade: ${msg}`);
+      Alert.alert('Test misslyckades', `Notistest felade: ${msg}`);
     }
   };
 
   return (
-    <View style={[styles.screen, { paddingTop: insets.top }]}>  
-      <Text style={styles.screenTitle}>TrackWell</Text>
-      {__DEV__ && (
-        <>
-          <Pressable onPress={runInstantNotificationTest} style={styles.minimalTriggerTestButton}>
-            <Text style={styles.minimalTriggerTestText}>Skicka testnotis nu</Text>
-          </Pressable>
-          <Pressable onPress={runMinimalTriggerTest} style={styles.minimalTriggerTestButton}>
-            <Text style={styles.minimalTriggerTestText}>Test 60s trigger</Text>
-          </Pressable>
-        </>
-      )}
+    <View style={[styles.screen, { paddingTop: insets.top }]}>
+      <View style={[styles.titleOverlay, { paddingTop: insets.top, paddingHorizontal: 16 }]}>
+        <Animated.Text style={[styles.screenTitle, { opacity: titleOpacity }]}>TrackWell</Animated.Text>
+        {__DEV__ && (
+          <>
+            <Pressable onPress={runInstantNotificationTest} style={styles.minimalTriggerTestButton}>
+              <Text style={styles.minimalTriggerTestText}>Skicka testnotis nu</Text>
+            </Pressable>
+            <Pressable onPress={runMinimalTriggerTest} style={styles.minimalTriggerTestButton}>
+              <Text style={styles.minimalTriggerTestText}>Test 60s trigger</Text>
+            </Pressable>
+          </>
+        )}
+      </View>
       {exercises.length === 0 ? (
-        <View style={styles.emptyState}>
+        <View style={[styles.emptyState, { paddingTop: TITLE_FADE_SCROLL_DISTANCE }]}>
           <Text style={styles.emptyTitle}>Inga övningar ännu</Text>
           <Text style={styles.emptySubtitle}>Tryck på ＋ för att lägga till din första övning</Text>
         </View>
       ) : (
-        <ScrollView contentContainerStyle={styles.listContent} onTouchEnd={() => closeAllSwipes()}>
+        <ScrollView
+          style={{ flex: 1 }}
+          contentContainerStyle={[styles.listContent, { paddingTop: TITLE_FADE_SCROLL_DISTANCE }]}
+          onTouchEnd={() => closeAllSwipes()}
+          onScroll={Animated.event(
+            [{ nativeEvent: { contentOffset: { y: scrollY } } }],
+            { useNativeDriver: false },
+          )}
+          scrollEventThrottle={16}
+        >
           {exercises.map((exercise) => (
             <Swipeable
               key={exercise.id}
@@ -709,11 +1044,43 @@ function TrainingScreen({
     { exerciseName: string; weightKg: number; oldBestReps: number; newBestReps: number }[]
   >([]);
   const [pbSummaryTotal, setPbSummaryTotal] = useState(0);
+  const [sessionExerciseMenuId, setSessionExerciseMenuId] = useState<string | null>(null);
+  const [sessionExerciseMenuTop, setSessionExerciseMenuTop] = useState<number>(100);
+  const [builderExerciseMenuId, setBuilderExerciseMenuId] = useState<string | null>(null);
+  const [builderExerciseMenuTop, setBuilderExerciseMenuTop] = useState<number>(100);
+  const [sessionMoveMode, setSessionMoveMode] = useState(false);
+  const [sessionMoveDraftOrder, setSessionMoveDraftOrder] = useState<string[] | null>(null);
+  const [builderMoveMode, setBuilderMoveMode] = useState(false);
+  const [builderMoveDraftOrder, setBuilderMoveDraftOrder] = useState<string[] | null>(null);
+  const [sessionDraggingExerciseId, setSessionDraggingExerciseId] = useState<string | null>(null);
+  const [builderDraggingExerciseId, setBuilderDraggingExerciseId] = useState<string | null>(null);
   const gymSheetTranslateY = useRef(new Animated.Value(150)).current;
   const gymSheetStartY = useRef(150);
   const pulseAnim = useRef(new Animated.Value(1)).current;
   const transitionAnim = useRef(new Animated.Value(1)).current;
   const transitionBlurOpacity = useRef(new Animated.Value(0)).current;
+  const sessionDragTranslateY = useRef(new Animated.Value(0)).current;
+  const builderDragTranslateY = useRef(new Animated.Value(0)).current;
+  const sessionMoveRowHeightRef = useRef(68);
+  const builderMoveRowHeightRef = useRef(68);
+  const sessionDragCurrentIndexRef = useRef(-1);
+  const sessionDragHoverIndexRef = useRef(-1);
+  const builderDragCurrentIndexRef = useRef(-1);
+  const builderDragHoverIndexRef = useRef(-1);
+  const sessionMoveDraftOrderRef = useRef<string[]>([]);
+  const builderMoveDraftOrderRef = useRef<string[]>([]);
+  const sessionMoveExerciseCountRef = useRef(0);
+  const builderMoveExerciseCountRef = useRef(0);
+  const sessionExerciseShiftAnims = useRef<Map<string, Animated.Value>>(new Map());
+  const builderExerciseShiftAnims = useRef<Map<string, Animated.Value>>(new Map());
+  const sessionMenuButtonRefs = useRef<Map<string, View | null>>(new Map());
+  const builderMenuButtonRefs = useRef<Map<string, View | null>>(new Map());
+  const sessionScrollRef = useRef<any>(null);
+  const sessionPostReleaseRafRef = useRef<number | null>(null);
+  const builderPostReleaseRafRef = useRef<number | null>(null);
+  const sessionScrollYRef = useRef(0);
+  const sessionScrollContentHeightRef = useRef(0);
+  const sessionScrollViewportHeightRef = useRef(0);
   const transitionBusyRef = useRef(false);
   const transitionBeforeOpenRef = useRef<(() => void) | null>(null);
   const cardBounceAnim = useRef(new Animated.Value(1)).current;
@@ -732,6 +1099,42 @@ function TrainingScreen({
   const [lastClosedView, setLastClosedView] = useState<Exclude<TrainingView, 'home'> | null>(null);
   const [pressedCardView, setPressedCardView] = useState<Exclude<TrainingView, 'home'> | null>(null);
   const lastOriginByViewRef = useRef<Partial<Record<Exclude<TrainingView, 'home'>, CardRect>>>({});
+  const trainingTitleScrollY = useRef(new Animated.Value(0)).current;
+  const trainingTitleOpacity = trainingTitleScrollY.interpolate({
+    inputRange: [0, TITLE_FADE_SCROLL_DISTANCE],
+    outputRange: [1, 0],
+    extrapolate: 'clamp',
+  });
+
+  // När användaren går tillbaka till home: återställ scroll så att titeln "Träning" syns igen
+  useEffect(() => {
+    if (view === 'home') {
+      trainingTitleScrollY.setValue(0);
+    }
+  }, [view, trainingTitleScrollY]);
+
+  useEffect(() => {
+    if (Platform.OS === 'android' && UIManager.setLayoutAnimationEnabledExperimental) {
+      UIManager.setLayoutAnimationEnabledExperimental(true);
+    }
+  }, []);
+
+  const animateTrainingLayout = useCallback(() => {
+    LayoutAnimation.configureNext({
+      duration: 220,
+      create: {
+        type: LayoutAnimation.Types.easeInEaseOut,
+        property: LayoutAnimation.Properties.opacity,
+      },
+      update: {
+        type: LayoutAnimation.Types.easeInEaseOut,
+      },
+      delete: {
+        type: LayoutAnimation.Types.easeInEaseOut,
+        property: LayoutAnimation.Properties.opacity,
+      },
+    });
+  }, []);
 
   const SESSION_STORAGE_KEY = 'naphab_active_session_v1';
 
@@ -1044,6 +1447,458 @@ function TrainingScreen({
   const closePbModal = () => {
     setPbModalExercise(null);
   };
+  const sessionRenderedExercises = useMemo(() => {
+    if (!sessionMoveMode || !sessionMoveDraftOrder) return sessionExercises;
+    const byId = new Map(sessionExercises.map((ex) => [ex.id, ex]));
+    return sessionMoveDraftOrder.map((id) => byId.get(id)).filter((ex): ex is SessionExercise => !!ex);
+  }, [sessionExercises, sessionMoveMode, sessionMoveDraftOrder]);
+  const getOrCreateShiftAnim = useCallback((exerciseId: string) => {
+    let anim = sessionExerciseShiftAnims.current.get(exerciseId);
+    if (!anim) {
+      anim = new Animated.Value(0);
+      sessionExerciseShiftAnims.current.set(exerciseId, anim);
+    }
+    return anim;
+  }, []);
+  const animateSessionMoveShifts = useCallback((
+    draggingExerciseId: string | null,
+    startIndex: number,
+    hoverIndex: number,
+    immediate = false,
+  ) => {
+    const rowHeight = Math.max(sessionMoveRowHeightRef.current, 1);
+    const draft = sessionMoveDraftOrderRef.current;
+    draft.forEach((exerciseId, index) => {
+      const shiftAnim = sessionExerciseShiftAnims.current.get(exerciseId);
+      if (!shiftAnim || exerciseId === draggingExerciseId) return;
+      let toValue = 0;
+      if (hoverIndex > startIndex && index > startIndex && index <= hoverIndex) {
+        toValue = -rowHeight;
+      } else if (hoverIndex < startIndex && index >= hoverIndex && index < startIndex) {
+        toValue = rowHeight;
+      }
+      if (immediate) {
+        shiftAnim.stopAnimation();
+        shiftAnim.setValue(toValue);
+      } else {
+        Animated.spring(shiftAnim, {
+          toValue,
+          useNativeDriver: true,
+          damping: 20,
+          stiffness: 280,
+          mass: 0.35,
+        }).start();
+      }
+    });
+  }, []);
+  const commitSessionDraftReorder = useCallback((fromIndex: number, toIndex: number) => {
+    const draft = sessionMoveDraftOrderRef.current;
+    if (
+      fromIndex === toIndex
+      || fromIndex < 0
+      || toIndex < 0
+      || fromIndex >= draft.length
+      || toIndex >= draft.length
+    ) {
+      return;
+    }
+    const next = [...draft];
+    const [moved] = next.splice(fromIndex, 1);
+    if (!moved) return;
+    next.splice(toIndex, 0, moved);
+    sessionMoveDraftOrderRef.current = next;
+    setSessionMoveDraftOrder(next);
+  }, []);
+  const removeSessionExercise = useCallback((exerciseId: string) => {
+    animateTrainingLayout();
+    setSessionExerciseMenuId((current) => (current === exerciseId ? null : current));
+    setSessionExerciseMenuTop(100);
+    setSessionDraggingExerciseId((current) => (current === exerciseId ? null : current));
+    setSessionExercises((prev) => prev.filter((item) => item.id !== exerciseId));
+  }, [animateTrainingLayout]);
+  const closeSessionExerciseMenu = useCallback(() => {
+    setSessionExerciseMenuId(null);
+    setSessionExerciseMenuTop(100);
+  }, []);
+  const openSessionExerciseMenu = useCallback((exerciseId: string) => {
+    const buttonRef = sessionMenuButtonRefs.current.get(exerciseId);
+    if (!buttonRef) {
+      setSessionExerciseMenuId(exerciseId);
+      return;
+    }
+    buttonRef.measureInWindow((_x, y, _width, height) => {
+      const screenHeight = Dimensions.get('window').height;
+      const menuHeightEstimate = 220;
+      const margin = 12;
+      const bottomOverlayReserve = 112;
+      const desiredTop = y + height + 6;
+      const minTop = insets.top + margin;
+      const maxTop = screenHeight - insets.bottom - bottomOverlayReserve - menuHeightEstimate - margin;
+      const clampedTop = Math.max(minTop, Math.min(desiredTop, maxTop));
+      setSessionExerciseMenuTop(clampedTop);
+      setSessionExerciseMenuId(exerciseId);
+    });
+  }, [insets.bottom, insets.top]);
+  const enterSessionMoveMode = useCallback(() => {
+    if (sessionExercises.length < 2) {
+      Alert.alert('Minst två övningar behövs', 'Lägg till minst två övningar för att kunna flytta ordningen.');
+      return;
+    }
+    if (sessionPostReleaseRafRef.current !== null) {
+      cancelAnimationFrame(sessionPostReleaseRafRef.current);
+      sessionPostReleaseRafRef.current = null;
+    }
+    const order = sessionExercises.map((ex) => ex.id);
+    sessionMoveDraftOrderRef.current = order;
+    sessionMoveExerciseCountRef.current = order.length;
+    setSessionDraggingExerciseId(null);
+    sessionDragCurrentIndexRef.current = -1;
+    sessionDragHoverIndexRef.current = -1;
+    sessionDragTranslateY.stopAnimation();
+    sessionDragTranslateY.setValue(0);
+    sessionExerciseShiftAnims.current.forEach((anim) => {
+      anim.stopAnimation();
+      anim.setValue(0);
+    });
+    animateTrainingLayout();
+    closeSessionExerciseMenu();
+    setSessionMoveDraftOrder(order);
+    setSessionMoveMode(true);
+  }, [animateTrainingLayout, closeSessionExerciseMenu, sessionDragTranslateY, sessionExercises]);
+  const exitSessionMoveMode = useCallback(() => {
+    const finalOrder = sessionMoveDraftOrderRef.current;
+    animateTrainingLayout();
+    closeSessionExerciseMenu();
+    if (finalOrder.length > 0) {
+      setSessionExercises((prev) => {
+        const byId = new Map(prev.map((ex) => [ex.id, ex]));
+        const reordered = finalOrder.map((id) => byId.get(id)).filter((ex): ex is SessionExercise => !!ex);
+        const remaining = prev.filter((ex) => !finalOrder.includes(ex.id));
+        return [...reordered, ...remaining];
+      });
+    }
+    setSessionMoveMode(false);
+    setSessionMoveDraftOrder(null);
+    sessionMoveDraftOrderRef.current = [];
+    sessionMoveExerciseCountRef.current = 0;
+    setSessionDraggingExerciseId(null);
+    sessionDragCurrentIndexRef.current = -1;
+    sessionDragHoverIndexRef.current = -1;
+    sessionExerciseShiftAnims.current.forEach((anim) => anim.setValue(0));
+    sessionDragTranslateY.stopAnimation();
+    sessionDragTranslateY.setValue(0);
+  }, [animateTrainingLayout, closeSessionExerciseMenu, sessionDragTranslateY]);
+  const sessionMovePanResponder = useRef(
+    PanResponder.create({
+      onStartShouldSetPanResponder: () => true,
+      onStartShouldSetPanResponderCapture: () => false,
+      onMoveShouldSetPanResponder: (_, gesture) => Math.abs(gesture.dy) > 4,
+      onMoveShouldSetPanResponderCapture: () => false,
+      onPanResponderTerminationRequest: () => false,
+      onPanResponderGrant: () => {
+        sessionDragTranslateY.stopAnimation();
+        sessionDragTranslateY.setValue(0);
+      },
+      onPanResponderMove: (_, gesture) => {
+        const rowHeight = Math.max(sessionMoveRowHeightRef.current, 1);
+        const startIndex = sessionDragCurrentIndexRef.current;
+        if (startIndex < 0) return;
+        const maxIndex = sessionMoveExerciseCountRef.current - 1;
+        const dragPosition = startIndex * rowHeight + gesture.dy;
+        const hoverIndex = Math.max(0, Math.min(maxIndex, Math.round(dragPosition / rowHeight)));
+        if (hoverIndex !== sessionDragHoverIndexRef.current) {
+          sessionDragHoverIndexRef.current = hoverIndex;
+          const draggingExerciseId = sessionMoveDraftOrderRef.current[startIndex] ?? null;
+          animateSessionMoveShifts(draggingExerciseId, startIndex, hoverIndex);
+        }
+        sessionDragTranslateY.setValue(gesture.dy);
+      },
+      onPanResponderRelease: () => {
+        const startIndex = sessionDragCurrentIndexRef.current;
+        const hoverIndex = sessionDragHoverIndexRef.current;
+        const rowHeight = Math.max(sessionMoveRowHeightRef.current, 1);
+        const targetOffset = (hoverIndex - startIndex) * rowHeight;
+        const draggingExerciseId = sessionMoveDraftOrderRef.current[startIndex] ?? null;
+        animateSessionMoveShifts(draggingExerciseId, startIndex, hoverIndex, true);
+        Animated.timing(sessionDragTranslateY, {
+          toValue: targetOffset,
+          useNativeDriver: true,
+          duration: 110,
+          easing: Easing.out(Easing.cubic),
+        }).start(() => {
+          commitSessionDraftReorder(startIndex, hoverIndex);
+          setSessionDraggingExerciseId(null);
+          sessionDragCurrentIndexRef.current = -1;
+          sessionDragHoverIndexRef.current = -1;
+          if (sessionPostReleaseRafRef.current !== null) {
+            cancelAnimationFrame(sessionPostReleaseRafRef.current);
+          }
+          sessionPostReleaseRafRef.current = requestAnimationFrame(() => {
+            sessionPostReleaseRafRef.current = null;
+            if (sessionDragCurrentIndexRef.current !== -1) return;
+            sessionExerciseShiftAnims.current.forEach((anim) => anim.setValue(0));
+            sessionDragTranslateY.setValue(0);
+          });
+        });
+      },
+      onPanResponderTerminate: () => {
+        animateSessionMoveShifts(null, 0, 0);
+        Animated.spring(sessionDragTranslateY, {
+          toValue: 0,
+          useNativeDriver: true,
+          damping: 18,
+          stiffness: 220,
+          mass: 0.35,
+        }).start(() => {
+          setSessionDraggingExerciseId(null);
+          sessionDragCurrentIndexRef.current = -1;
+          sessionDragHoverIndexRef.current = -1;
+        });
+      },
+    }),
+  ).current;
+  const startDraggingExercise = useCallback((exerciseId: string, index: number) => {
+    if (sessionPostReleaseRafRef.current !== null) {
+      cancelAnimationFrame(sessionPostReleaseRafRef.current);
+      sessionPostReleaseRafRef.current = null;
+    }
+    closeSessionExerciseMenu();
+    setSessionDraggingExerciseId(exerciseId);
+    sessionDragCurrentIndexRef.current = index;
+    sessionDragHoverIndexRef.current = index;
+    sessionExerciseShiftAnims.current.forEach((anim) => anim.setValue(0));
+    sessionDragTranslateY.stopAnimation();
+    sessionDragTranslateY.setValue(0);
+    animateSessionMoveShifts(exerciseId, index, index);
+  }, [animateSessionMoveShifts, closeSessionExerciseMenu, sessionDragTranslateY]);
+  const builderRenderedExercises = useMemo(() => {
+    if (!builderMoveMode || !builderMoveDraftOrder) return builderExercises;
+    const byId = new Map(builderExercises.map((ex) => [ex.id, ex]));
+    return builderMoveDraftOrder.map((id) => byId.get(id)).filter((ex): ex is WorkoutPlanExercise => !!ex);
+  }, [builderExercises, builderMoveDraftOrder, builderMoveMode]);
+  const getOrCreateBuilderShiftAnim = useCallback((exerciseId: string) => {
+    let anim = builderExerciseShiftAnims.current.get(exerciseId);
+    if (!anim) {
+      anim = new Animated.Value(0);
+      builderExerciseShiftAnims.current.set(exerciseId, anim);
+    }
+    return anim;
+  }, []);
+  const animateBuilderMoveShifts = useCallback((
+    draggingExerciseId: string | null,
+    startIndex: number,
+    hoverIndex: number,
+    immediate = false,
+  ) => {
+    const rowHeight = Math.max(builderMoveRowHeightRef.current, 1);
+    const draft = builderMoveDraftOrderRef.current;
+    draft.forEach((exerciseId, index) => {
+      const shiftAnim = builderExerciseShiftAnims.current.get(exerciseId);
+      if (!shiftAnim || exerciseId === draggingExerciseId) return;
+      let toValue = 0;
+      if (hoverIndex > startIndex && index > startIndex && index <= hoverIndex) {
+        toValue = -rowHeight;
+      } else if (hoverIndex < startIndex && index >= hoverIndex && index < startIndex) {
+        toValue = rowHeight;
+      }
+      if (immediate) {
+        shiftAnim.stopAnimation();
+        shiftAnim.setValue(toValue);
+      } else {
+        Animated.spring(shiftAnim, {
+          toValue,
+          useNativeDriver: true,
+          damping: 20,
+          stiffness: 280,
+          mass: 0.35,
+        }).start();
+      }
+    });
+  }, []);
+  const commitBuilderDraftReorder = useCallback((fromIndex: number, toIndex: number) => {
+    const draft = builderMoveDraftOrderRef.current;
+    if (
+      fromIndex === toIndex
+      || fromIndex < 0
+      || toIndex < 0
+      || fromIndex >= draft.length
+      || toIndex >= draft.length
+    ) {
+      return;
+    }
+    const next = [...draft];
+    const [moved] = next.splice(fromIndex, 1);
+    if (!moved) return;
+    next.splice(toIndex, 0, moved);
+    builderMoveDraftOrderRef.current = next;
+    setBuilderMoveDraftOrder(next);
+  }, []);
+  const removeBuilderExercise = useCallback((exerciseId: string) => {
+    animateTrainingLayout();
+    setBuilderExerciseMenuId((current) => (current === exerciseId ? null : current));
+    setBuilderExerciseMenuTop(100);
+    setBuilderDraggingExerciseId((current) => (current === exerciseId ? null : current));
+    setBuilderExercises((prev) => prev.filter((item) => item.id !== exerciseId));
+  }, [animateTrainingLayout, setBuilderExercises]);
+  const closeBuilderExerciseMenu = useCallback(() => {
+    setBuilderExerciseMenuId(null);
+    setBuilderExerciseMenuTop(100);
+  }, []);
+  const openBuilderExerciseMenu = useCallback((exerciseId: string) => {
+    const buttonRef = builderMenuButtonRefs.current.get(exerciseId);
+    if (!buttonRef) {
+      setBuilderExerciseMenuId(exerciseId);
+      return;
+    }
+    buttonRef.measureInWindow((_x, y, _width, height) => {
+      const screenHeight = Dimensions.get('window').height;
+      const menuHeightEstimate = 220;
+      const margin = 12;
+      const bottomOverlayReserve = 112;
+      const desiredTop = y + height + 6;
+      const minTop = insets.top + margin;
+      const maxTop = screenHeight - insets.bottom - bottomOverlayReserve - menuHeightEstimate - margin;
+      const clampedTop = Math.max(minTop, Math.min(desiredTop, maxTop));
+      setBuilderExerciseMenuTop(clampedTop);
+      setBuilderExerciseMenuId(exerciseId);
+    });
+  }, [insets.bottom, insets.top]);
+  const resolveBuilderExercisePbId = useCallback((exercise: WorkoutPlanExercise) => {
+    if (exercise.libraryExerciseId) return exercise.libraryExerciseId;
+    return `name:${exercise.name.trim().toLowerCase()}`;
+  }, []);
+  const enterBuilderMoveMode = useCallback(() => {
+    if (builderExercises.length < 2) {
+      Alert.alert('Minst två övningar behövs', 'Lägg till minst två övningar för att kunna flytta ordningen.');
+      return;
+    }
+    if (builderPostReleaseRafRef.current !== null) {
+      cancelAnimationFrame(builderPostReleaseRafRef.current);
+      builderPostReleaseRafRef.current = null;
+    }
+    const order = builderExercises.map((ex) => ex.id);
+    builderMoveDraftOrderRef.current = order;
+    builderMoveExerciseCountRef.current = order.length;
+    setBuilderDraggingExerciseId(null);
+    builderDragCurrentIndexRef.current = -1;
+    builderDragHoverIndexRef.current = -1;
+    builderDragTranslateY.stopAnimation();
+    builderDragTranslateY.setValue(0);
+    builderExerciseShiftAnims.current.forEach((anim) => {
+      anim.stopAnimation();
+      anim.setValue(0);
+    });
+    animateTrainingLayout();
+    closeBuilderExerciseMenu();
+    setBuilderMoveDraftOrder(order);
+    setBuilderMoveMode(true);
+  }, [animateTrainingLayout, builderDragTranslateY, builderExercises, closeBuilderExerciseMenu]);
+  const exitBuilderMoveMode = useCallback(() => {
+    const finalOrder = builderMoveDraftOrderRef.current;
+    animateTrainingLayout();
+    closeBuilderExerciseMenu();
+    if (finalOrder.length > 0) {
+      setBuilderExercises((prev) => {
+        const byId = new Map(prev.map((ex) => [ex.id, ex]));
+        const reordered = finalOrder.map((id) => byId.get(id)).filter((ex): ex is WorkoutPlanExercise => !!ex);
+        const remaining = prev.filter((ex) => !finalOrder.includes(ex.id));
+        return [...reordered, ...remaining];
+      });
+    }
+    setBuilderMoveMode(false);
+    setBuilderMoveDraftOrder(null);
+    builderMoveDraftOrderRef.current = [];
+    builderMoveExerciseCountRef.current = 0;
+    setBuilderDraggingExerciseId(null);
+    builderDragCurrentIndexRef.current = -1;
+    builderDragHoverIndexRef.current = -1;
+    builderExerciseShiftAnims.current.forEach((anim) => anim.setValue(0));
+    builderDragTranslateY.stopAnimation();
+    builderDragTranslateY.setValue(0);
+  }, [animateTrainingLayout, builderDragTranslateY, closeBuilderExerciseMenu]);
+  const builderMovePanResponder = useRef(
+    PanResponder.create({
+      onStartShouldSetPanResponder: () => true,
+      onStartShouldSetPanResponderCapture: () => false,
+      onMoveShouldSetPanResponder: (_, gesture) => Math.abs(gesture.dy) > 4,
+      onMoveShouldSetPanResponderCapture: () => false,
+      onPanResponderTerminationRequest: () => false,
+      onPanResponderGrant: () => {
+        builderDragTranslateY.stopAnimation();
+        builderDragTranslateY.setValue(0);
+      },
+      onPanResponderMove: (_, gesture) => {
+        const rowHeight = Math.max(builderMoveRowHeightRef.current, 1);
+        const startIndex = builderDragCurrentIndexRef.current;
+        if (startIndex < 0) return;
+        const maxIndex = builderMoveExerciseCountRef.current - 1;
+        const dragPosition = startIndex * rowHeight + gesture.dy;
+        const hoverIndex = Math.max(0, Math.min(maxIndex, Math.round(dragPosition / rowHeight)));
+        if (hoverIndex !== builderDragHoverIndexRef.current) {
+          builderDragHoverIndexRef.current = hoverIndex;
+          const draggingExerciseId = builderMoveDraftOrderRef.current[startIndex] ?? null;
+          animateBuilderMoveShifts(draggingExerciseId, startIndex, hoverIndex);
+        }
+        builderDragTranslateY.setValue(gesture.dy);
+      },
+      onPanResponderRelease: () => {
+        const startIndex = builderDragCurrentIndexRef.current;
+        const hoverIndex = builderDragHoverIndexRef.current;
+        const rowHeight = Math.max(builderMoveRowHeightRef.current, 1);
+        const targetOffset = (hoverIndex - startIndex) * rowHeight;
+        const draggingExerciseId = builderMoveDraftOrderRef.current[startIndex] ?? null;
+        animateBuilderMoveShifts(draggingExerciseId, startIndex, hoverIndex, true);
+        Animated.timing(builderDragTranslateY, {
+          toValue: targetOffset,
+          useNativeDriver: true,
+          duration: 110,
+          easing: Easing.out(Easing.cubic),
+        }).start(() => {
+          commitBuilderDraftReorder(startIndex, hoverIndex);
+          setBuilderDraggingExerciseId(null);
+          builderDragCurrentIndexRef.current = -1;
+          builderDragHoverIndexRef.current = -1;
+          if (builderPostReleaseRafRef.current !== null) {
+            cancelAnimationFrame(builderPostReleaseRafRef.current);
+          }
+          builderPostReleaseRafRef.current = requestAnimationFrame(() => {
+            builderPostReleaseRafRef.current = null;
+            if (builderDragCurrentIndexRef.current !== -1) return;
+            builderExerciseShiftAnims.current.forEach((anim) => anim.setValue(0));
+            builderDragTranslateY.setValue(0);
+          });
+        });
+      },
+      onPanResponderTerminate: () => {
+        animateBuilderMoveShifts(null, 0, 0);
+        Animated.spring(builderDragTranslateY, {
+          toValue: 0,
+          useNativeDriver: true,
+          damping: 18,
+          stiffness: 220,
+          mass: 0.35,
+        }).start(() => {
+          setBuilderDraggingExerciseId(null);
+          builderDragCurrentIndexRef.current = -1;
+          builderDragHoverIndexRef.current = -1;
+        });
+      },
+    }),
+  ).current;
+  const startDraggingBuilderExercise = useCallback((exerciseId: string, index: number) => {
+    if (builderPostReleaseRafRef.current !== null) {
+      cancelAnimationFrame(builderPostReleaseRafRef.current);
+      builderPostReleaseRafRef.current = null;
+    }
+    closeBuilderExerciseMenu();
+    setBuilderDraggingExerciseId(exerciseId);
+    builderDragCurrentIndexRef.current = index;
+    builderDragHoverIndexRef.current = index;
+    builderExerciseShiftAnims.current.forEach((anim) => anim.setValue(0));
+    builderDragTranslateY.stopAnimation();
+    builderDragTranslateY.setValue(0);
+    animateBuilderMoveShifts(exerciseId, index, index);
+  }, [animateBuilderMoveShifts, builderDragTranslateY, closeBuilderExerciseMenu]);
   const confirmAbortWorkout = () => {
     Alert.alert(
       'Avbryta pass?',
@@ -1080,7 +1935,7 @@ function TrainingScreen({
     if (libraryMode === 'session') {
       setSessionExercises((prev) => [...prev, { id: `${Date.now()}-${Math.random()}`, libraryExerciseId: exercise.id, name: exercise.name, sets: [] }]);
     } else {
-      setBuilderExercises((prev) => [...prev, { id: `${Date.now()}-${Math.random()}`, libraryExerciseId: exercise.id, name: exercise.name, sets: 1, reps: 10, repsPerSet: [10] }]);
+      setBuilderExercises((prev) => [...prev, { id: `${Date.now()}-${Math.random()}`, libraryExerciseId: exercise.id, name: exercise.name, sets: 1, reps: 0, repsPerSet: [0] }]);
     }
     setGymLibraryVisible(false);
     setLibraryMode(null);
@@ -1170,24 +2025,41 @@ function TrainingScreen({
     setGymCategoryCustomInput('');
   };
 
-  const sessionAddSet = (exerciseId: string) =>
+  const scrollSessionToBottom = useCallback(() => {
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        const maxY = Math.max(0, sessionScrollContentHeightRef.current - sessionScrollViewportHeightRef.current);
+        const currentY = sessionScrollYRef.current;
+        if (maxY <= currentY + 2) return;
+        const midY = currentY + (maxY - currentY) * 0.58;
+        sessionScrollRef.current?.scrollTo?.({ y: midY, animated: true });
+        setTimeout(() => {
+          sessionScrollRef.current?.scrollTo?.({ y: maxY, animated: true });
+        }, 170);
+      });
+    });
+  }, []);
+  const sessionAddSet = useCallback((exerciseId: string, shouldScrollToEnd = false) => {
     setSessionExercises((prev) =>
       prev.map((exercise) => {
         if (exercise.id !== exerciseId) return exercise;
-        const last = exercise.sets[exercise.sets.length - 1];
         return {
           ...exercise,
           sets: [
             ...exercise.sets,
             {
               id: `${Date.now()}-${Math.random()}`,
-              reps: last?.reps ?? 10,
-              weightKg: last?.weightKg ?? 40,
+              reps: 0,
+              weightKg: 0,
             },
           ],
         };
       }),
     );
+    if (shouldScrollToEnd) {
+      scrollSessionToBottom();
+    }
+  }, [scrollSessionToBottom]);
 
   const sessionRemoveLastSet = (exerciseId: string) =>
     setSessionExercises((prev) =>
@@ -1197,7 +2069,7 @@ function TrainingScreen({
       }),
     );
 
-  const sessionAdjustSet = (exerciseId: string, setId: string, field: 'reps' | 'weightKg', delta: number) =>
+  const sessionSetValue = (exerciseId: string, setId: string, field: 'reps' | 'weightKg', value: number) =>
     setSessionExercises((prev) =>
       prev.map((exercise) =>
         exercise.id !== exerciseId
@@ -1206,9 +2078,8 @@ function TrainingScreen({
               ...exercise,
               sets: exercise.sets.map((setEntry) => {
                 if (setEntry.id !== setId) return setEntry;
-                if (field === 'reps') return { ...setEntry, reps: Math.max(1, Math.min(50, setEntry.reps + delta)) };
-                const next = Math.round((setEntry.weightKg + delta) * 2) / 2;
-                return { ...setEntry, weightKg: Math.max(0, Math.min(400, next)) };
+                if (field === 'reps') return { ...setEntry, reps: clampNumber(Math.round(value), 0, 50) };
+                return { ...setEntry, weightKg: clampNumber(Math.round(value * WEIGHT_KEY_FACTOR) / WEIGHT_KEY_FACTOR, 0, 400) };
               }),
             },
       ),
@@ -1610,6 +2481,32 @@ function TrainingScreen({
     const sub = BackHandler.addEventListener('hardwareBackPress', onBackPress);
     return () => sub.remove();
   }, [closeGymLibrary, goHomeWithReverseTransition, goBackToSaved, gymLibraryVisible, view]);
+  useEffect(() => {
+    if (view === 'session') return;
+    closeSessionExerciseMenu();
+    setSessionMoveMode(false);
+    setSessionMoveDraftOrder(null);
+    sessionMoveDraftOrderRef.current = [];
+    sessionMoveExerciseCountRef.current = 0;
+    setSessionDraggingExerciseId(null);
+    sessionDragCurrentIndexRef.current = -1;
+    sessionDragHoverIndexRef.current = -1;
+    sessionExerciseShiftAnims.current.forEach((anim) => anim.setValue(0));
+    sessionDragTranslateY.setValue(0);
+  }, [closeSessionExerciseMenu, sessionDragTranslateY, view]);
+  useEffect(() => {
+    if (view === 'builder') return;
+    closeBuilderExerciseMenu();
+    setBuilderMoveMode(false);
+    setBuilderMoveDraftOrder(null);
+    builderMoveDraftOrderRef.current = [];
+    builderMoveExerciseCountRef.current = 0;
+    setBuilderDraggingExerciseId(null);
+    builderDragCurrentIndexRef.current = -1;
+    builderDragHoverIndexRef.current = -1;
+    builderExerciseShiftAnims.current.forEach((anim) => anim.setValue(0));
+    builderDragTranslateY.setValue(0);
+  }, [builderDragTranslateY, closeBuilderExerciseMenu, view]);
   const gymSheetCloseThreshold = Math.round(gymSheetMaxDrag * 0.25);
   const gymSheetPanResponder = useRef(
     PanResponder.create({
@@ -1643,15 +2540,15 @@ function TrainingScreen({
     }),
   ).current;
 
-  const builderUpdateSetReps = (exerciseId: string, setIndex: number, delta: number) => {
+  const builderSetSetReps = (exerciseId: string, setIndex: number, value: number) => {
     setBuilderExercises((prev) =>
       prev.map((e) => {
         if (e.id !== exerciseId) return e;
         const rp = getRepsPerSet(e);
         if (setIndex < 0 || setIndex >= rp.length) return e;
         const next = [...rp];
-        next[setIndex] = Math.max(1, Math.min(99, next[setIndex] + delta));
-        return { ...e, repsPerSet: next, sets: next.length, reps: next[0] ?? 10 };
+        next[setIndex] = clampNumber(Math.round(value), 0, 99);
+        return { ...e, repsPerSet: next, sets: next.length, reps: next[0] ?? 0 };
       }),
     );
   };
@@ -1661,9 +2558,8 @@ function TrainingScreen({
       prev.map((e) => {
         if (e.id !== exerciseId) return e;
         const rp = getRepsPerSet(e);
-        const last = rp[rp.length - 1] ?? 10;
-        const next = [...rp, last];
-        return { ...e, repsPerSet: next, sets: next.length, reps: next[0] ?? 10 };
+        const next = [...rp, 0];
+        return { ...e, repsPerSet: next, sets: next.length, reps: next[0] ?? 0 };
       }),
     );
   };
@@ -1675,7 +2571,7 @@ function TrainingScreen({
         const rp = getRepsPerSet(e);
         if (rp.length <= 1) return e;
         const next = rp.slice(0, -1);
-        return { ...e, repsPerSet: next, sets: next.length, reps: next[0] ?? 10 };
+        return { ...e, repsPerSet: next, sets: next.length, reps: next[0] ?? 0 };
       }),
     );
   };
@@ -1689,7 +2585,7 @@ function TrainingScreen({
     const name = builderName.trim() || `Pass ${new Intl.DateTimeFormat('sv-SE', { day: '2-digit', month: '2-digit' }).format(new Date())}`;
     const exercisesToSave = builderExercises.map((exercise) => {
       const rp = getRepsPerSet(exercise);
-      return { ...exercise, repsPerSet: rp, sets: rp.length, reps: rp[0] ?? 10 };
+      return { ...exercise, repsPerSet: rp, sets: rp.length, reps: rp[0] ?? 0 };
     });
     setWorkoutPlans((prev) => {
       if (editingPlanId) {
@@ -1832,7 +2728,11 @@ function TrainingScreen({
 
   return (
     <View style={[styles.screen, { paddingTop: insets.top }]}>
-      <Text style={styles.screenTitleSmall}>Träning</Text>
+      {view === 'home' ? (
+        <View style={[styles.titleOverlay, { paddingTop: insets.top, paddingHorizontal: 16 }]}>
+          <Animated.Text style={[styles.screenTitle, { opacity: trainingTitleOpacity }]}>Träning</Animated.Text>
+        </View>
+      ) : null}
       <View style={styles.trainingTransitionHost}>
         <Animated.View
           ref={trainingViewRef}
@@ -1850,7 +2750,15 @@ function TrainingScreen({
           ]}
         >
       {view === 'home' ? (
-        <ScrollView contentContainerStyle={styles.listContent}>
+        <ScrollView
+          style={{ flex: 1 }}
+          contentContainerStyle={[styles.listContent, { paddingTop: TITLE_FADE_SCROLL_DISTANCE }]}
+          onScroll={Animated.event(
+            [{ nativeEvent: { contentOffset: { y: trainingTitleScrollY } } }],
+            { useNativeDriver: false },
+          )}
+          scrollEventThrottle={16}
+        >
           {/* Primär kort: Starta träning / Fortsätt pågående */}
           {sessionStartedAtIso ? (
             <Animated.View style={{ transform: [{ scale: pulseAnim }, { scale: lastClosedView === 'session' ? cardBounceAnim : 1 }, { scale: pressedCardView === 'session' ? cardPressAnim : 1 }] }}>
@@ -2023,72 +2931,211 @@ function TrainingScreen({
               </View>
             </View>
           </View>
-          <ScrollView contentContainerStyle={styles.listContent}>
-            {sessionExercises.length === 0 ? <Text style={styles.loggedSetEmpty}>Inga övningar än. Tryck på ＋.</Text> : null}
-            {sessionExercises.map((exercise) => (
-              <View key={exercise.id} style={styles.trainingCard}>
-                <View style={styles.trainingHeader}>
-                  <Pressable onPress={() => openPbModal(exercise)}>
-                    <Text style={styles.trainingTitle}>{exercise.name}</Text>
-                  </Pressable>
-                  <Pressable onPress={() => setSessionExercises((prev) => prev.filter((item) => item.id !== exercise.id))}>
-                    <MaterialIcons name="delete" size={22} color="#EF9A9A" />
-                  </Pressable>
+          <ScrollView
+            ref={sessionScrollRef}
+            contentContainerStyle={[styles.listContent, { paddingBottom: 176 + insets.bottom }]}
+            onScrollBeginDrag={closeSessionExerciseMenu}
+            scrollEnabled={!(sessionMoveMode && !!sessionDraggingExerciseId)}
+            scrollEventThrottle={16}
+            onScroll={(event) => {
+              sessionScrollYRef.current = event.nativeEvent.contentOffset.y;
+            }}
+            onContentSizeChange={(_w, h) => {
+              sessionScrollContentHeightRef.current = h;
+            }}
+            onLayout={(event) => {
+              sessionScrollViewportHeightRef.current = event.nativeEvent.layout.height;
+            }}
+          >
+            {sessionMoveMode ? (
+              <View style={styles.sessionMoveBanner}>
+                <View style={styles.sessionMoveBannerTextWrap}>
+                  <Text style={styles.sessionMoveBannerTitle}>Flytta övningar</Text>
+                  <Text style={styles.sessionMoveBannerSubtitle}>Dra i handtaget för att ändra ordningen.</Text>
                 </View>
-                <View style={styles.loggedSetList}>
-                  {exercise.sets.length === 0 ? <Text style={styles.loggedSetEmpty}>Inga set ännu. Tryck på + Set.</Text> : null}
-                  {exercise.sets.map((setEntry, index) => (
-                    <View key={setEntry.id} style={styles.loggedSetRow}>
-                      <View style={styles.loggedSetRowMain}>
-                        <Text style={styles.loggedSetTitle}>Set {index + 1}</Text>
-                        <View style={styles.loggedSetMetrics}>
-                          <Text style={styles.loggedSetMetricLabel}>Reps</Text>
-                          <View style={styles.trainingStatActions}>
-                            <Pressable style={styles.trainingStatButton} onPress={() => sessionAdjustSet(exercise.id, setEntry.id, 'reps', -1)}>
-                              <Text style={styles.trainingStatButtonText}>-</Text>
-                            </Pressable>
-                            <Text style={styles.loggedSetMetricValue}>{setEntry.reps}</Text>
-                            <Pressable style={styles.trainingStatButton} onPress={() => sessionAdjustSet(exercise.id, setEntry.id, 'reps', 1)}>
-                              <Text style={styles.trainingStatButtonText}>+</Text>
-                            </Pressable>
-                          </View>
-                        </View>
-                        <View style={styles.loggedSetMetrics}>
-                          <Text style={styles.loggedSetMetricLabel}>Vikt</Text>
-                          <View style={styles.trainingStatActions}>
-                            <Pressable style={styles.trainingStatButton} onPress={() => sessionAdjustSet(exercise.id, setEntry.id, 'weightKg', -2.5)}>
-                              <Text style={styles.trainingStatButtonText}>-</Text>
-                            </Pressable>
-                            <Text style={styles.loggedSetMetricValue}>{setEntry.weightKg} kg</Text>
-                            <Pressable style={styles.trainingStatButton} onPress={() => sessionAdjustSet(exercise.id, setEntry.id, 'weightKg', 2.5)}>
-                              <Text style={styles.trainingStatButtonText}>+</Text>
-                            </Pressable>
-                          </View>
-                        </View>
-                      </View>
-                      {(() => {
-                        const feedback = sessionSetFeedbackBySetKey.get(`${exercise.id}|${setEntry.id}`);
-                        if (!feedback) return null;
-                        return (
-                          <View style={styles.pbFeedbackBox}>
-                            <Text style={styles.pbFeedbackTitle}>{feedback.kind === 'new' ? '🏆 NYTT PB!' : 'Nuvarande PB'}</Text>
-                          </View>
-                        );
-                      })()}
-                    </View>
-                  ))}
-                </View>
-                <View style={styles.trainingButtons}>
-                  <Button
-                    mode="outlined"
-                    disabled={exercise.sets.length === 0}
-                    onPress={() => sessionRemoveLastSet(exercise.id)}
-                  >− Set</Button>
-                  <Button mode="contained" onPress={() => sessionAddSet(exercise.id)}>+ Set</Button>
-                </View>
+                <Pressable style={styles.sessionMoveDoneButton} onPress={exitSessionMoveMode}>
+                  <Text style={styles.sessionMoveDoneButtonText}>Klar</Text>
+                </Pressable>
               </View>
-            ))}
+            ) : null}
+            {sessionRenderedExercises.length === 0 ? <Text style={styles.loggedSetEmpty}>Inga övningar än. Tryck på ＋.</Text> : null}
+            {sessionRenderedExercises.map((exercise, exerciseIndex) => {
+              const isDragging = sessionDraggingExerciseId === exercise.id;
+              const handleLocked = !!sessionDraggingExerciseId && !isDragging;
+              const shiftAnim = getOrCreateShiftAnim(exercise.id);
+              return (
+                <Animated.View
+                  key={exercise.id}
+                  onLayout={(event) => {
+                    if (!sessionMoveMode) return;
+                    sessionMoveRowHeightRef.current = event.nativeEvent.layout.height + 12;
+                  }}
+                  style={[
+                    styles.trainingCard,
+                    sessionMoveMode && styles.trainingCardCollapsed,
+                    isDragging && styles.trainingCardDragging,
+                    {
+                      transform: [
+                        { translateY: isDragging ? sessionDragTranslateY : shiftAnim },
+                      ],
+                    },
+                  ]}
+                >
+                  <View style={styles.trainingHeader}>
+                    <Pressable
+                      style={styles.trainingTitlePressable}
+                      disabled={sessionMoveMode}
+                      onPress={() => openPbModal(exercise)}
+                    >
+                      <Text style={styles.trainingTitle} numberOfLines={1}>{exercise.name}</Text>
+                    </Pressable>
+                    {sessionMoveMode ? (
+                      <View
+                        style={[
+                          styles.sessionMoveHandle,
+                          isDragging && styles.sessionMoveHandleActive,
+                          handleLocked && styles.sessionMoveHandleDisabled,
+                        ]}
+                        onStartShouldSetResponder={() => true}
+                        onTouchStart={() => {
+                          if (handleLocked) return;
+                          startDraggingExercise(exercise.id, exerciseIndex);
+                        }}
+                        {...sessionMovePanResponder.panHandlers}
+                      >
+                        <MaterialCommunityIcons name="drag-horizontal-variant" size={22} color="#DCE4EC" />
+                      </View>
+                    ) : (
+                      <Pressable
+                        ref={(instance) => {
+                          if (instance) {
+                            sessionMenuButtonRefs.current.set(exercise.id, instance);
+                          } else {
+                            sessionMenuButtonRefs.current.delete(exercise.id);
+                          }
+                        }}
+                        style={styles.trainingMiniMenuButton}
+                        onPress={() => openSessionExerciseMenu(exercise.id)}
+                      >
+                        <MaterialCommunityIcons name="dots-horizontal" size={20} color="#DCE4EC" />
+                      </Pressable>
+                    )}
+                  </View>
+                  {sessionMoveMode ? null : (
+                    <>
+                      <View style={styles.loggedSetList}>
+                        {exercise.sets.length === 0 ? <Text style={styles.loggedSetEmpty}>Inga set ännu. Tryck på + Set.</Text> : null}
+                        {exercise.sets.map((setEntry, index) => {
+                          const feedback = sessionSetFeedbackBySetKey.get(`${exercise.id}|${setEntry.id}`);
+                          return (
+                            <View key={setEntry.id} style={styles.loggedSetRow}>
+                              <View style={styles.loggedSetRowTop}>
+                                <View style={styles.loggedSetRowMain}>
+                                  <Text style={styles.loggedSetTitle}>Set {index + 1}</Text>
+                                  <View style={styles.loggedSetMetrics}>
+                                    <Text style={styles.loggedSetMetricLabel}>Reps</Text>
+                                    <NumericStepperInput
+                                      value={setEntry.reps}
+                                      onChangeValue={(value) => sessionSetValue(exercise.id, setEntry.id, 'reps', value)}
+                                      min={0}
+                                      max={50}
+                                      accessibilityLabel={`Reps för set ${index + 1}`}
+                                    />
+                                  </View>
+                                  <View style={styles.loggedSetMetrics}>
+                                    <Text style={styles.loggedSetMetricLabel}>Vikt</Text>
+                                    <NumericStepperInput
+                                      value={setEntry.weightKg}
+                                      onChangeValue={(value) => sessionSetValue(exercise.id, setEntry.id, 'weightKg', value)}
+                                      min={0}
+                                      max={400}
+                                      allowDecimal
+                                      accessibilityLabel={`Vikt för set ${index + 1}`}
+                                    />
+                                  </View>
+                                </View>
+                                {feedback ? (
+                                  <Pressable style={styles.pbFeedbackBoxInline} onPress={() => openPbModal(exercise)}>
+                                    <Text style={styles.pbFeedbackTitle}>{feedback.kind === 'new' ? 'Nytt PB' : 'PB nu'}</Text>
+                                  </Pressable>
+                                ) : null}
+                              </View>
+                            </View>
+                          );
+                        })}
+                      </View>
+                      <View style={styles.trainingButtons}>
+                        <Button
+                          mode="outlined"
+                          disabled={exercise.sets.length === 0}
+                          onPress={() => sessionRemoveLastSet(exercise.id)}
+                        >− Set</Button>
+                        <Button
+                          mode="contained"
+                          onPress={() => sessionAddSet(exercise.id, exerciseIndex === sessionRenderedExercises.length - 1)}
+                        >
+                          + Set
+                        </Button>
+                      </View>
+                    </>
+                  )}
+                </Animated.View>
+              );
+            })}
           </ScrollView>
+          {/* Exercise dropdown menu - rendered as overlay */}
+          {sessionExerciseMenuId ? (
+            <>
+              <Pressable
+                style={styles.sessionDropdownBackdrop}
+                onPress={closeSessionExerciseMenu}
+              />
+              <View style={[styles.sessionDropdownMenu, { top: sessionExerciseMenuTop }]}>
+                {(() => {
+                  const menuExercise = sessionRenderedExercises.find((ex) => ex.id === sessionExerciseMenuId);
+                  if (!menuExercise) return null;
+                  return (
+                    <>
+                      <Text style={styles.sessionDropdownTitle}>{menuExercise.name}</Text>
+                      <View style={styles.sessionDropdownDivider} />
+                      <Pressable
+                        style={styles.sessionDropdownItem}
+                        onPress={() => {
+                          const id = menuExercise.id;
+                          closeSessionExerciseMenu();
+                          removeSessionExercise(id);
+                        }}
+                      >
+                        <MaterialIcons name="delete-outline" size={18} color="#EF9A9A" />
+                        <Text style={[styles.sessionDropdownItemText, { color: '#EF9A9A' }]}>Ta bort övningen</Text>
+                      </Pressable>
+                      <Pressable
+                        style={styles.sessionDropdownItem}
+                        onPress={() => {
+                          const ex = menuExercise;
+                          closeSessionExerciseMenu();
+                          openPbModal(ex);
+                        }}
+                      >
+                        <MaterialCommunityIcons name="trophy-outline" size={18} color="#DCE4EC" />
+                        <Text style={styles.sessionDropdownItemText}>PBs</Text>
+                      </Pressable>
+                      <Pressable
+                        style={styles.sessionDropdownItem}
+                        onPress={() => {
+                          closeSessionExerciseMenu();
+                          enterSessionMoveMode();
+                        }}
+                      >
+                        <MaterialCommunityIcons name="drag-horizontal-variant" size={18} color="#DCE4EC" />
+                        <Text style={styles.sessionDropdownItemText}>Flytta</Text>
+                      </Pressable>
+                    </>
+                  );
+                })()}
+              </View>
+            </>
+          ) : null}
         </View>
       ) : null}
 
@@ -2142,51 +3189,164 @@ function TrainingScreen({
               </View>
             </View>
           </View>
-          <ScrollView contentContainerStyle={styles.listContent}>
+          <ScrollView
+            contentContainerStyle={styles.listContent}
+            onScrollBeginDrag={closeBuilderExerciseMenu}
+            scrollEnabled={!(builderMoveMode && !!builderDraggingExerciseId)}
+          >
             <TextInput value={builderName} onChangeText={setBuilderName} style={styles.input} placeholder="Namn på pass" placeholderTextColor={PLACEHOLDER_COLOR} />
-            {builderExercises.length === 0 ? <Text style={styles.loggedSetEmpty}>Lägg till övningar med ＋.</Text> : null}
-            {builderExercises.map((exercise) => {
+            {builderMoveMode ? (
+              <View style={styles.sessionMoveBanner}>
+                <View style={styles.sessionMoveBannerTextWrap}>
+                  <Text style={styles.sessionMoveBannerTitle}>Flytta övningar</Text>
+                  <Text style={styles.sessionMoveBannerSubtitle}>Dra i handtaget för att ändra ordningen.</Text>
+                </View>
+                <Pressable style={styles.sessionMoveDoneButton} onPress={exitBuilderMoveMode}>
+                  <Text style={styles.sessionMoveDoneButtonText}>Klar</Text>
+                </Pressable>
+              </View>
+            ) : null}
+            {builderRenderedExercises.length === 0 ? <Text style={styles.loggedSetEmpty}>Lägg till övningar med ＋.</Text> : null}
+            {builderRenderedExercises.map((exercise, exerciseIndex) => {
               const repsArr = getRepsPerSet(exercise);
+              const isDragging = builderDraggingExerciseId === exercise.id;
+              const handleLocked = !!builderDraggingExerciseId && !isDragging;
+              const shiftAnim = getOrCreateBuilderShiftAnim(exercise.id);
               return (
-                <View key={exercise.id} style={styles.trainingCard}>
+                <Animated.View
+                  key={exercise.id}
+                  onLayout={(event) => {
+                    if (!builderMoveMode) return;
+                    builderMoveRowHeightRef.current = event.nativeEvent.layout.height + 12;
+                  }}
+                  style={[
+                    styles.trainingCard,
+                    builderMoveMode && styles.trainingCardCollapsed,
+                    isDragging && styles.trainingCardDragging,
+                    {
+                      transform: [
+                        { translateY: isDragging ? builderDragTranslateY : shiftAnim },
+                      ],
+                    },
+                  ]}
+                >
                   <View style={styles.trainingHeader}>
                     <Text style={styles.trainingTitle}>{exercise.name}</Text>
-                    <Pressable onPress={() => setBuilderExercises((prev) => prev.filter((item) => item.id !== exercise.id))}>
-                      <MaterialIcons name="delete" size={22} color="#EF9A9A" />
-                    </Pressable>
-                  </View>
-                  <View style={{ paddingLeft: 12, paddingRight: 12, paddingBottom: 12, borderTopWidth: 1, borderTopColor: '#253545' }}>
-                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 6, marginBottom: 2 }}>
-                      <View style={{ minWidth: 36 }} />
-                      <Text style={[styles.loggedSetMetricLabel, { marginLeft: 32 }]}>Reps</Text>
-                    </View>
-                    {repsArr.map((repsVal, setIdx) => (
-                      <View key={setIdx} style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 6 }}>
-                        <Text style={[styles.loggedSetMetricLabel, { minWidth: 36 }]}>Set {setIdx + 1}</Text>
-                        <View style={styles.trainingStatActions}>
-                          <Pressable style={styles.trainingStatButton} onPress={() => builderUpdateSetReps(exercise.id, setIdx, -1)}>
-                            <Text style={styles.trainingStatButtonText}>-</Text>
-                          </Pressable>
-                          <Text style={styles.loggedSetMetricValue}>{repsVal}</Text>
-                          <Pressable style={styles.trainingStatButton} onPress={() => builderUpdateSetReps(exercise.id, setIdx, 1)}>
-                            <Text style={styles.trainingStatButtonText}>+</Text>
-                          </Pressable>
-                        </View>
+                    {builderMoveMode ? (
+                      <View
+                        style={[
+                          styles.sessionMoveHandle,
+                          isDragging && styles.sessionMoveHandleActive,
+                          handleLocked && styles.sessionMoveHandleDisabled,
+                        ]}
+                        onStartShouldSetResponder={() => true}
+                        onTouchStart={() => {
+                          if (handleLocked) return;
+                          startDraggingBuilderExercise(exercise.id, exerciseIndex);
+                        }}
+                        {...builderMovePanResponder.panHandlers}
+                      >
+                        <MaterialCommunityIcons name="drag-horizontal-variant" size={22} color="#DCE4EC" />
                       </View>
-                    ))}
-                    <View style={styles.trainingButtons}>
-                      <Button
-                        mode="outlined"
-                        disabled={repsArr.length <= 1}
-                        onPress={() => builderRemoveSet(exercise.id)}
-                      >− Set</Button>
-                      <Button mode="contained" onPress={() => builderAddSet(exercise.id)}>+ Set</Button>
-                    </View>
+                    ) : (
+                      <Pressable
+                        ref={(instance) => {
+                          if (instance) {
+                            builderMenuButtonRefs.current.set(exercise.id, instance);
+                          } else {
+                            builderMenuButtonRefs.current.delete(exercise.id);
+                          }
+                        }}
+                        style={styles.trainingMiniMenuButton}
+                        onPress={() => openBuilderExerciseMenu(exercise.id)}
+                      >
+                        <MaterialCommunityIcons name="dots-horizontal" size={20} color="#DCE4EC" />
+                      </Pressable>
+                    )}
                   </View>
-                </View>
+                  {builderMoveMode ? null : (
+                    <View style={{ paddingLeft: 12, paddingRight: 12, paddingBottom: 12, borderTopWidth: 1, borderTopColor: '#253545' }}>
+                      {repsArr.map((repsVal, setIdx) => (
+                        <View key={setIdx} style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 4 }}>
+                          <Text style={[styles.loggedSetMetricLabel, { minWidth: 36 }]}>Set {setIdx + 1}</Text>
+                          <View style={styles.loggedSetMetrics}>
+                            <Text style={styles.loggedSetMetricLabel}>Reps</Text>
+                            <NumericStepperInput
+                              value={repsVal}
+                              onChangeValue={(value) => builderSetSetReps(exercise.id, setIdx, value)}
+                              min={0}
+                              max={99}
+                              accessibilityLabel={`Reps för set ${setIdx + 1} i ${exercise.name}`}
+                            />
+                          </View>
+                        </View>
+                      ))}
+                      <View style={styles.trainingButtons}>
+                        <Button
+                          mode="outlined"
+                          disabled={repsArr.length <= 1}
+                          onPress={() => builderRemoveSet(exercise.id)}
+                        >− Set</Button>
+                        <Button mode="contained" onPress={() => builderAddSet(exercise.id)}>+ Set</Button>
+                      </View>
+                    </View>
+                  )}
+                </Animated.View>
               );
             })}
           </ScrollView>
+          {builderExerciseMenuId ? (
+            <>
+              <Pressable
+                style={styles.sessionDropdownBackdrop}
+                onPress={closeBuilderExerciseMenu}
+              />
+              <View style={[styles.sessionDropdownMenu, { top: builderExerciseMenuTop }]}>
+                {(() => {
+                  const menuExercise = builderRenderedExercises.find((ex) => ex.id === builderExerciseMenuId);
+                  if (!menuExercise) return null;
+                  const pbId = resolveBuilderExercisePbId(menuExercise);
+                  return (
+                    <>
+                      <Text style={styles.sessionDropdownTitle}>{menuExercise.name}</Text>
+                      <View style={styles.sessionDropdownDivider} />
+                      <Pressable
+                        style={styles.sessionDropdownItem}
+                        onPress={() => {
+                          const id = menuExercise.id;
+                          closeBuilderExerciseMenu();
+                          removeBuilderExercise(id);
+                        }}
+                      >
+                        <MaterialIcons name="delete-outline" size={18} color="#EF9A9A" />
+                        <Text style={[styles.sessionDropdownItemText, { color: '#EF9A9A' }]}>Ta bort övningen</Text>
+                      </Pressable>
+                      <Pressable
+                        style={styles.sessionDropdownItem}
+                        onPress={() => {
+                          closeBuilderExerciseMenu();
+                          openPbModalByExerciseId(pbId, menuExercise.name);
+                        }}
+                      >
+                        <MaterialCommunityIcons name="trophy-outline" size={18} color="#DCE4EC" />
+                        <Text style={styles.sessionDropdownItemText}>PBs</Text>
+                      </Pressable>
+                      <Pressable
+                        style={styles.sessionDropdownItem}
+                        onPress={() => {
+                          closeBuilderExerciseMenu();
+                          enterBuilderMoveMode();
+                        }}
+                      >
+                        <MaterialCommunityIcons name="drag-horizontal-variant" size={18} color="#DCE4EC" />
+                        <Text style={styles.sessionDropdownItemText}>Flytta</Text>
+                      </Pressable>
+                    </>
+                  );
+                })()}
+              </View>
+            </>
+          ) : null}
         </View>
       ) : null}
 
@@ -2327,7 +3487,11 @@ function TrainingScreen({
           pointerEvents="none"
           style={[styles.trainingBlurOverlay, { opacity: 0 }]}
         >
-          <BlurView intensity={42} tint="dark" style={StyleSheet.absoluteFillObject} />
+          {Platform.OS === 'ios' ? (
+            <View style={[StyleSheet.absoluteFillObject, styles.iosBlurFallback]} />
+          ) : (
+            <BlurView intensity={42} tint="dark" style={StyleSheet.absoluteFillObject} />
+          )}
         </Animated.View>
       </View>
 
@@ -2668,47 +3832,158 @@ function TrainingScreen({
   );
 }
 
+type AnalysisType = 'rehabFrequency' | 'exerciseProgression' | 'muscleGroupBars' | 'distributionPie';
+type ProgressMetric = 'topWeight' | 'totalSets';
+type MuscleMetric = 'sets' | 'volume';
+type DistributionMetric = 'sets' | 'volume';
+type WeeklyBucket = { key: string; start: Date; end: Date; label: string; headerLabel: string };
+type ProgressionOption = { key: string; label: string };
+type PieSlice = { label: string; value: number; color: string };
+type AnalysisBlock = {
+  id: string;
+  type: AnalysisType;
+  exerciseKey?: string;
+  muscleGroupTag?: string;
+  progressMetric?: ProgressMetric;
+  muscleMetric?: MuscleMetric;
+  distributionMetric?: DistributionMetric;
+};
+
+const WEEK_WIDTH = 64;
+const NON_MUSCLE_TAGS = new Set(['Maskin', 'Fria vikter', 'Kabel', 'Kroppsvikt', 'Egen']);
+
+const startOfWeekLocal = (date: Date) => {
+  const next = new Date(date);
+  next.setHours(0, 0, 0, 0);
+  const diff = (next.getDay() + 6) % 7;
+  next.setDate(next.getDate() - diff);
+  return next;
+};
+
+const getIsoWeekNumber = (date: Date) => {
+  const next = new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()));
+  const dayNum = next.getUTCDay() || 7;
+  next.setUTCDate(next.getUTCDate() + 4 - dayNum);
+  const yearStart = new Date(Date.UTC(next.getUTCFullYear(), 0, 1));
+  return Math.ceil((((next.getTime() - yearStart.getTime()) / 86400000) + 1) / 7);
+};
+
+const formatWeekKey = (date: Date) => formatDateKeyLocal(startOfWeekLocal(date));
+
+const buildTimelineWeeks = (count = 14): WeeklyBucket[] => {
+  const currentWeekStart = startOfWeekLocal(new Date());
+  const buckets: WeeklyBucket[] = [];
+  for (let offset = count - 1; offset >= 0; offset -= 1) {
+    const start = new Date(currentWeekStart);
+    start.setDate(currentWeekStart.getDate() - offset * 7);
+    const end = new Date(start);
+    end.setDate(start.getDate() + 6);
+    buckets.push({
+      key: formatDateKeyLocal(start),
+      start,
+      end,
+      label: `v${getIsoWeekNumber(start)}`,
+      headerLabel: `${shortDate(start)}-${shortDate(end)}`,
+    });
+  }
+  return buckets;
+};
+
+const normalizeExerciseNameKey = (value: string) => value.trim().toLowerCase();
+const isMuscleGroupTag = (tag: string) => !NON_MUSCLE_TAGS.has(tag);
+const polarToCartesian = (cx: number, cy: number, radius: number, angleDeg: number) => {
+  const angleRad = ((angleDeg - 90) * Math.PI) / 180;
+  return {
+    x: cx + radius * Math.cos(angleRad),
+    y: cy + radius * Math.sin(angleRad),
+  };
+};
+
+const describePieSlice = (cx: number, cy: number, radius: number, startAngle: number, endAngle: number) => {
+  const start = polarToCartesian(cx, cy, radius, endAngle);
+  const end = polarToCartesian(cx, cy, radius, startAngle);
+  const largeArcFlag = endAngle - startAngle <= 180 ? 0 : 1;
+  return [
+    `M ${cx} ${cy}`,
+    `L ${start.x} ${start.y}`,
+    `A ${radius} ${radius} 0 ${largeArcFlag} 0 ${end.x} ${end.y}`,
+    'Z',
+  ].join(' ');
+};
+
 function AnalysisScreen({
   exercises,
   logs,
+  completedWorkouts = [],
+  workoutPlans = [],
+  gymLibraryExercises = [],
+  onPlusActionChange,
 }: {
   exercises: Exercise[];
   logs: ExerciseLog[];
+  completedWorkouts?: CompletedWorkout[];
+  exerciseWeightPbs?: ExerciseWeightPb[];
+  workoutPlans?: WorkoutPlan[];
+  gymLibraryExercises?: LibraryExercise[];
+  onPlusActionChange?: (action: (() => void) | null) => void;
 }) {
   const insets = useSafeAreaInsets();
   const chartTopPadding = 12;
   const chartBottomPadding = 36;
-  const days = useMemo(() => buildTimelineDays(), []);
-  const [menuOpen, setMenuOpen] = useState(false);
-  const [selected, setSelected] = useState<string[]>(exercises.map((exercise) => exercise.id));
-  const [headerMonth, setHeaderMonth] = useState(monthTitle(new Date()));
-  const [viewportWidth, setViewportWidth] = useState(Dimensions.get('window').width - 32);
-  const scrollRef = useRef<ScrollView>(null);
-
-  useEffect(() => {
-    setSelected((prev) => {
-      const existing = new Set(exercises.map((exercise) => exercise.id));
-      const kept = prev.filter((id) => existing.has(id));
-      if (kept.length > 0) return kept;
-      return exercises.map((exercise) => exercise.id);
-    });
-  }, [exercises]);
-
-  useEffect(() => {
-    const id = setTimeout(() => {
-      const todayIndex = 60;
-      const x = Math.max(todayIndex * DAY_WIDTH - viewportWidth / 2 + DAY_WIDTH / 2, 0);
-      scrollRef.current?.scrollTo({ x, animated: false });
-    }, 50);
-    return () => clearTimeout(id);
-  }, [viewportWidth]);
-
   const chartHeight = 240;
-  const selectedExercises = exercises.filter((exercise) => selected.includes(exercise.id));
+  const lineChartHeight = 230;
+  const days = useMemo(() => buildTimelineDays(), []);
+  const weeks = useMemo(() => buildTimelineWeeks(), []);
+  const weekKeySet = useMemo(() => new Set(weeks.map((week) => week.key)), [weeks]);
+  const [analysisBlocks, setAnalysisBlocks] = useState<AnalysisBlock[]>([{ id: '1', type: 'rehabFrequency' }]);
+  const [analysisPickerOpen, setAnalysisPickerOpen] = useState(false);
+  const [progressionExercisePickerOpen, setProgressionExercisePickerOpen] = useState(false);
+  const [progressionPickerTargetBlockId, setProgressionPickerTargetBlockId] = useState<string | null>(null);
+  const [muscleGroupPickerOpen, setMuscleGroupPickerOpen] = useState(false);
+  const [headerLabelByBlockId, setHeaderLabelByBlockId] = useState<Record<string, string>>({});
+  const scrollRefsByBlockId = useRef<Record<string, { scrollTo: (options: { x?: number; y?: number; animated?: boolean }) => void } | null>>({});
+
+  useEffect(() => {
+    onPlusActionChange?.(() => setAnalysisPickerOpen(true));
+    return () => onPlusActionChange?.(null);
+  }, [onPlusActionChange]);
+
+  const gymLibraryById = useMemo(
+    () => new Map(gymLibraryExercises.map((exercise) => [exercise.id, exercise])),
+    [gymLibraryExercises],
+  );
+  const gymLibraryByName = useMemo(
+    () => new Map(gymLibraryExercises.map((exercise) => [normalizeExerciseNameKey(exercise.name), exercise])),
+    [gymLibraryExercises],
+  );
+
+  const progressionOptions = useMemo(() => {
+    const byKey = new Map<string, ProgressionOption>();
+    completedWorkouts.forEach((workout) => {
+      workout.exercises.forEach((exercise) => {
+        const libraryExercise = exercise.libraryExerciseId
+          ? gymLibraryById.get(exercise.libraryExerciseId)
+          : gymLibraryByName.get(normalizeExerciseNameKey(exercise.name));
+        const key = libraryExercise?.id
+          ? `lib:${libraryExercise.id}`
+          : `name:${normalizeExerciseNameKey(exercise.name)}`;
+        if (!byKey.has(key)) {
+          byKey.set(key, { key, label: libraryExercise?.name ?? exercise.name });
+        }
+      });
+    });
+    return Array.from(byKey.values()).sort((a, b) => a.label.localeCompare(b.label, 'sv'));
+  }, [completedWorkouts, gymLibraryById, gymLibraryByName]);
+
+  const muscleGroupTags = useMemo(
+    () => [...new Set(gymLibraryExercises.flatMap((exercise) => exercise.tags.filter(isMuscleGroupTag)))].sort((a, b) => a.localeCompare(b, 'sv')),
+    [gymLibraryExercises],
+  );
+
   const dailyTargetByExerciseId = useMemo(
     () =>
       new Map(
-        selectedExercises.map((exercise) => [
+        exercises.map((exercise) => [
           exercise.id,
           {
             baseTarget: Math.max(1, exercise.times.length || 0),
@@ -2716,71 +3991,243 @@ function AnalysisScreen({
           },
         ]),
       ),
-    [selectedExercises],
+    [exercises],
   );
-  const dayCounts = useMemo(() => {
+
+  const dayCountsExercises = useMemo(() => {
     const map = new Map<string, Record<string, number>>();
     days.forEach((day) => map.set(formatDateKeyLocal(day), {}));
     logs.forEach((log) => {
-      const key = formatDateKeyLocal(new Date(log.atIso));
-      const perExercise = map.get(key);
-      if (!perExercise) return;
-      perExercise[log.exerciseId] = (perExercise[log.exerciseId] || 0) + 1;
+      const dayKey = formatDateKeyLocal(new Date(log.atIso));
+      const dayRow = map.get(dayKey);
+      if (!dayRow) return;
+      dayRow[log.exerciseId] = (dayRow[log.exerciseId] || 0) + 1;
     });
     return map;
   }, [days, logs]);
-  const maxValue = Math.max(
-    1,
-    ...selectedExercises.map((exercise) => dailyTargetByExerciseId.get(exercise.id)?.baseTarget || 1),
-  );
+
+  const progressionSeriesByExercise = useMemo(() => {
+    const series = new Map<string, Record<ProgressMetric, Map<string, number>>>();
+    const ensureSeries = (exerciseKey: string) => {
+      let existing = series.get(exerciseKey);
+      if (existing) return existing;
+      existing = {
+        topWeight: new Map(weeks.map((week) => [week.key, 0])),
+        totalSets: new Map(weeks.map((week) => [week.key, 0])),
+      };
+      series.set(exerciseKey, existing);
+      return existing;
+    };
+
+    completedWorkouts.forEach((workout) => {
+      const weekKey = formatWeekKey(new Date(workout.endedAtIso));
+      if (!weekKeySet.has(weekKey)) return;
+      workout.exercises.forEach((exercise) => {
+        const libraryExercise = exercise.libraryExerciseId
+          ? gymLibraryById.get(exercise.libraryExerciseId)
+          : gymLibraryByName.get(normalizeExerciseNameKey(exercise.name));
+        const exerciseKey = libraryExercise?.id
+          ? `lib:${libraryExercise.id}`
+          : `name:${normalizeExerciseNameKey(exercise.name)}`;
+        const metricSeries = ensureSeries(exerciseKey);
+        let topWeight = metricSeries.topWeight.get(weekKey) || 0;
+        let totalSets = metricSeries.totalSets.get(weekKey) || 0;
+
+        exercise.sets.forEach((setEntry) => {
+          const reps = Math.max(0, setEntry.reps);
+          const weight = Math.max(0, setEntry.weightKg);
+          if (reps <= 0) return;
+          topWeight = Math.max(topWeight, weight);
+          totalSets += 1;
+        });
+
+        metricSeries.topWeight.set(weekKey, topWeight);
+        metricSeries.totalSets.set(weekKey, totalSets);
+      });
+    });
+
+    return series;
+  }, [completedWorkouts, gymLibraryById, gymLibraryByName, weekKeySet, weeks]);
+
+  const muscleGroupWeeklySets = useMemo(() => {
+    const map = new Map<string, Map<string, number>>();
+    muscleGroupTags.forEach((tag) => map.set(tag, new Map(weeks.map((week) => [week.key, 0]))));
+    completedWorkouts.forEach((workout) => {
+      const weekKey = formatWeekKey(new Date(workout.endedAtIso));
+      if (!weekKeySet.has(weekKey)) return;
+      workout.exercises.forEach((exercise) => {
+        const libraryExercise = exercise.libraryExerciseId
+          ? gymLibraryById.get(exercise.libraryExerciseId)
+          : gymLibraryByName.get(normalizeExerciseNameKey(exercise.name));
+        const tags = (libraryExercise?.tags ?? []).filter(isMuscleGroupTag);
+        const setsCount = exercise.sets.filter((setEntry) => setEntry.reps > 0).length;
+        tags.forEach((tag) => {
+          const row = map.get(tag);
+          if (!row) return;
+          row.set(weekKey, (row.get(weekKey) || 0) + setsCount);
+        });
+      });
+    });
+    return map;
+  }, [completedWorkouts, gymLibraryById, gymLibraryByName, muscleGroupTags, weekKeySet, weeks]);
+
+  const muscleGroupWeeklyVolume = useMemo(() => {
+    const map = new Map<string, Map<string, number>>();
+    muscleGroupTags.forEach((tag) => map.set(tag, new Map(weeks.map((week) => [week.key, 0]))));
+    completedWorkouts.forEach((workout) => {
+      const weekKey = formatWeekKey(new Date(workout.endedAtIso));
+      if (!weekKeySet.has(weekKey)) return;
+      workout.exercises.forEach((exercise) => {
+        const libraryExercise = exercise.libraryExerciseId
+          ? gymLibraryById.get(exercise.libraryExerciseId)
+          : gymLibraryByName.get(normalizeExerciseNameKey(exercise.name));
+        const tags = (libraryExercise?.tags ?? []).filter(isMuscleGroupTag);
+        const volume = exercise.sets.reduce((sum, setEntry) => (
+          setEntry.reps > 0 ? sum + Math.max(0, setEntry.weightKg) * Math.max(0, setEntry.reps) : sum
+        ), 0);
+        tags.forEach((tag) => {
+          const row = map.get(tag);
+          if (!row) return;
+          row.set(weekKey, (row.get(weekKey) || 0) + volume);
+        });
+      });
+    });
+    return map;
+  }, [completedWorkouts, gymLibraryById, gymLibraryByName, muscleGroupTags, weekKeySet, weeks]);
+
+  const distributionSlicesByMetric = useMemo(() => {
+    const buildSlices = (metric: DistributionMetric) => {
+      const source = metric === 'sets' ? muscleGroupWeeklySets : muscleGroupWeeklyVolume;
+      const totals = muscleGroupTags.map((tag, index) => ({
+        label: tag,
+        value: Array.from(source.get(tag)?.values() ?? []).reduce((sum, value) => sum + value, 0),
+        color: SERIES_COLORS[index % SERIES_COLORS.length],
+      })).filter((slice) => slice.value > 0)
+        .sort((a, b) => b.value - a.value);
+      if (totals.length <= 6) return totals;
+      const visible = totals.slice(0, 5);
+      const restValue = totals.slice(5).reduce((sum, slice) => sum + slice.value, 0);
+      return [...visible, { label: 'Övrigt', value: restValue, color: '#5D6D7E' }];
+    };
+    return {
+      sets: buildSlices('sets'),
+      volume: buildSlices('volume'),
+    };
+  }, [muscleGroupTags, muscleGroupWeeklySets, muscleGroupWeeklyVolume]);
+
+  const maxValueExercises = Math.max(1, ...exercises.map((exercise) => dailyTargetByExerciseId.get(exercise.id)?.baseTarget || 1));
   const drawableChartHeight = chartHeight - chartTopPadding - chartBottomPadding;
+  const lineDrawableHeight = lineChartHeight - chartTopPadding - chartBottomPadding;
   const segmentGap = 2;
+  const viewportWidth = Dimensions.get('window').width - 32;
+  const visibleBlocks = analysisBlocks.filter((block) => {
+    if (block.type === 'exerciseProgression') return !!block.exerciseKey;
+    if (block.type === 'muscleGroupBars') return !!block.muscleGroupTag;
+    return true;
+  });
 
-  return (
-    <View style={[styles.screen, { paddingTop: insets.top }]}>
-      <Text style={styles.screenTitleSmall}>Analys</Text>
-      <View style={styles.dropdownRow}>
-        <Button mode="outlined" textColor="#90CAF9" icon="filter-variant" onPress={() => setMenuOpen(true)}>
-          Välj övningar
-        </Button>
-        <Text style={styles.dropdownHint}>{selectedExercises.length} valda</Text>
-      </View>
-      <Portal>
-        <Dialog visible={menuOpen} onDismiss={() => setMenuOpen(false)}>
-          <Dialog.Title>Visa i analys</Dialog.Title>
-          <Dialog.Content>
-            {exercises.map((exercise) => (
-              <Pressable
-                key={exercise.id}
-                onPress={() =>
-                  setSelected((prev) =>
-                    prev.includes(exercise.id) ? prev.filter((id) => id !== exercise.id) : [...prev, exercise.id],
-                  )
-                }
-                style={styles.dropdownItem}
-              >
-                <View style={[styles.dot, { backgroundColor: exercise.color }]} />
-                <Text style={styles.dropdownText}>{exercise.title}</Text>
-                <Checkbox status={selected.includes(exercise.id) ? 'checked' : 'unchecked'} />
-              </Pressable>
-            ))}
-          </Dialog.Content>
-          <Dialog.Actions>
-            <Button onPress={() => setMenuOpen(false)}>Klar</Button>
-          </Dialog.Actions>
-        </Dialog>
-      </Portal>
+  const progressMetricLabel = (metric: ProgressMetric) => {
+    if (metric === 'topWeight') return 'Tyngsta vikt';
+    return 'Totala set';
+  };
 
-      <Text style={styles.monthTitle}>{headerMonth}</Text>
-      <View style={styles.chartCard} onLayout={(event) => setViewportWidth(event.nativeEvent.layout.width)}>
+  const muscleMetricLabel = (metric: MuscleMetric) => metric === 'sets' ? 'Set' : 'Volym';
+
+  const blockTitle = (block: AnalysisBlock) => {
+    if (block.type === 'rehabFrequency') return 'Dagliga övningar';
+    if (block.type === 'exerciseProgression') return 'Progression per övning';
+    if (block.type === 'muscleGroupBars') return 'Muskelgrupp';
+    return 'Fördelning';
+  };
+
+  const helpTextByType = (block: AnalysisBlock) => {
+    if (block.type === 'rehabFrequency') return 'Varje segment i stapeln = 1 registrering. Linjen visar dagens mål.';
+    if (block.type === 'exerciseProgression') {
+      return (block.progressMetric ?? 'topWeight') === 'topWeight'
+        ? 'Visar den tyngsta vikten du använt för övningen varje vecka.'
+        : 'Visar hur många arbetsset du gjort för övningen varje vecka.';
+    }
+    if (block.type === 'muscleGroupBars') {
+      return (block.muscleMetric ?? 'sets') === 'sets'
+        ? 'Antal set per vecka. Övningar med flera muskelgrupper räknas på varje grupp.'
+        : 'Total volym per vecka. Övningar med flera muskelgrupper räknas på varje grupp.';
+    }
+    return 'Fördelning över de senaste veckorna. Cirkeldiagrammet är ett komplement, inte huvudgrafen.';
+  };
+
+  const addBlock = (block: AnalysisBlock) => {
+    setAnalysisBlocks((prev) => [...prev, block]);
+    setAnalysisPickerOpen(false);
+    setProgressionExercisePickerOpen(false);
+    setProgressionPickerTargetBlockId(null);
+    setMuscleGroupPickerOpen(false);
+  };
+
+  const createBlockId = () => `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+
+  const removeBlock = (blockId: string) => {
+    setAnalysisBlocks((prev) => prev.filter((block) => block.id !== blockId));
+  };
+
+  const updateProgressionExercise = (blockId: string, exerciseKey: string) => {
+    setAnalysisBlocks((prev) => prev.map((block) => (
+      block.id === blockId ? { ...block, exerciseKey } : block
+    )));
+    setProgressionExercisePickerOpen(false);
+    setProgressionPickerTargetBlockId(null);
+  };
+
+  const renderWeeklyBarChart = (values: number[], color: string) => {
+    const maxValue = Math.max(1, ...values);
+    return weeks.map((week, index) => {
+      const value = values[index] || 0;
+      const barWidth = Math.max(8, WEEK_WIDTH - 20);
+      const x = index * WEEK_WIDTH + (WEEK_WIDTH - barWidth) / 2;
+      const barHeight = maxValue <= 0 ? 0 : (value / maxValue) * drawableChartHeight;
+      const y = chartHeight - chartBottomPadding - barHeight;
+      return (
+        <Rect
+          key={`${week.key}-bar`}
+          x={x}
+          y={y}
+          width={barWidth}
+          height={Math.max(0, barHeight)}
+          fill={color}
+          rx={4}
+        />
+      );
+    });
+  };
+
+  const renderRehabCard = (block: AnalysisBlock) => (
+    <View key={block.id} style={styles.analysisBlockCard}>
+      <View style={styles.analysisCardSurface}>
+        <View style={styles.analysisBlockHeader}>
+          <View style={styles.analysisBlockHeaderText}>
+            <Text style={styles.analysisBlockTitle}>{blockTitle(block)}</Text>
+            <Text style={styles.analysisBlockSubtitle}>Daglig följsamhet för dina rehabövningar</Text>
+          </View>
+          <Pressable onPress={() => removeBlock(block.id)} hitSlop={8} style={styles.analysisBlockRemove}>
+            <MaterialCommunityIcons name="close" size={22} color="#9AAEC0" />
+          </Pressable>
+        </View>
+        <Text style={styles.monthTitle}>{headerLabelByBlockId[block.id] ?? monthTitle(new Date())}</Text>
+        <View style={styles.analysisChartWrap}>
         <ScrollView
           horizontal
-          ref={scrollRef}
+          ref={(ref: any) => { scrollRefsByBlockId.current[block.id] = ref; }}
           showsHorizontalScrollIndicator={false}
           onScroll={(event) => {
-            const centerIndex = Math.round((event.nativeEvent.contentOffset.x + viewportWidth / 2) / DAY_WIDTH);
+            const viewportW = event.nativeEvent.layoutMeasurement?.width ?? viewportWidth;
+            const centerIndex = Math.round((event.nativeEvent.contentOffset.x + viewportW / 2) / DAY_WIDTH);
             const day = days[Math.max(0, Math.min(days.length - 1, centerIndex))];
-            setHeaderMonth(monthTitle(day));
+            setHeaderLabelByBlockId((prev) => ({ ...prev, [block.id]: monthTitle(day) }));
+          }}
+          onLayout={(event) => {
+            const width = event.nativeEvent.layout.width;
+            const todayIndex = 60;
+            const x = Math.max(todayIndex * DAY_WIDTH - width / 2 + DAY_WIDTH / 2, 0);
+            setTimeout(() => scrollRefsByBlockId.current[block.id]?.scrollTo({ x, animated: false }), 50);
           }}
           scrollEventThrottle={16}
         >
@@ -2801,19 +4248,18 @@ function AnalysisScreen({
                 );
               })}
 
-              {days.map((day, index) => {
-                const counts = dayCounts.get(formatDateKeyLocal(day)) || {};
-                const bars = selectedExercises.length || 1;
-                const w = (DAY_WIDTH - 12) / bars;
-                return selectedExercises.map((exercise, barIndex) => {
-                  const value = counts[exercise.id] || 0;
-                  const x = index * DAY_WIDTH + 6 + barIndex * w;
-                  const barWidth = Math.max(4, w - 2);
+              {days.flatMap((day, index) =>
+                exercises.map((exercise, barIndex) => {
+                  const bars = exercises.length || 1;
+                  const barSlotWidth = (DAY_WIDTH - 12) / bars;
+                  const value = (dayCountsExercises.get(formatDateKeyLocal(day)) || {})[exercise.id] || 0;
+                  const x = index * DAY_WIDTH + 6 + barIndex * barSlotWidth;
+                  const barWidth = Math.max(4, barSlotWidth - 2);
                   const targetInfo = dailyTargetByExerciseId.get(exercise.id);
                   const isActiveDay = !!targetInfo && targetInfo.activeDays.has(day.getDay());
                   const targetValue = isActiveDay ? targetInfo?.baseTarget || 1 : 0;
-                  const targetY = chartHeight - chartBottomPadding - (targetValue / maxValue) * drawableChartHeight;
-                  const unitHeight = drawableChartHeight / maxValue;
+                  const targetY = chartHeight - chartBottomPadding - (targetValue / maxValueExercises) * drawableChartHeight;
+                  const unitHeight = drawableChartHeight / maxValueExercises;
                   const segmentHeight = Math.max(2, unitHeight - segmentGap);
                   const segmentCount = Math.max(0, Math.floor(value));
                   return (
@@ -2821,15 +4267,25 @@ function AnalysisScreen({
                       {Array.from({ length: segmentCount }).map((_, segmentIndex) => {
                         const segmentBottomY = chartHeight - chartBottomPadding - segmentIndex * unitHeight;
                         const y = segmentBottomY - segmentHeight;
-                        return <Rect key={`${exercise.id}-${formatDateKeyLocal(day)}-seg-${segmentIndex}`} x={x} y={y} width={barWidth} height={segmentHeight} fill={exercise.color} rx={2} />;
+                        return (
+                          <Rect
+                            key={`${exercise.id}-${formatDateKeyLocal(day)}-seg-${segmentIndex}`}
+                            x={x}
+                            y={y}
+                            width={barWidth}
+                            height={segmentHeight}
+                            fill={exercise.color}
+                            rx={2}
+                          />
+                        );
                       })}
                       {targetValue > 0 ? (
                         <Line x1={x} y1={targetY} x2={x + barWidth} y2={targetY} stroke={exercise.color} strokeWidth={1.6} />
                       ) : null}
                     </React.Fragment>
                   );
-                });
-              })}
+                }),
+              )}
             </Svg>
             <View style={styles.axisRow}>
               {days.map((day, index) => {
@@ -2843,10 +4299,452 @@ function AnalysisScreen({
                 );
               })}
             </View>
-            <Text style={styles.chartHelpText}>Varje segment i stapeln = 1 registrering. Linjen visar dagens mål.</Text>
           </View>
         </ScrollView>
+        <Text style={styles.chartHelpText}>{helpTextByType(block)}</Text>
+        <View style={styles.chartLegend}>
+          {exercises.map((exercise) => (
+            <View key={exercise.id} style={styles.chartLegendItem}>
+              <View style={[styles.dot, { backgroundColor: exercise.color }]} />
+              <Text style={styles.chartLegendText} numberOfLines={1}>{exercise.title}</Text>
+            </View>
+          ))}
+        </View>
       </View>
+      </View>
+    </View>
+  );
+
+  const renderProgressionCard = (block: AnalysisBlock) => {
+    const progressMetric = block.progressMetric ?? 'topWeight';
+    const exerciseLabel = progressionOptions.find((option) => option.key === block.exerciseKey)?.label ?? 'Välj övning';
+    const metricSeries = block.exerciseKey ? progressionSeriesByExercise.get(block.exerciseKey)?.[progressMetric] : undefined;
+    const values = weeks.map((week) => metricSeries?.get(week.key) || 0);
+    const maxValue = Math.max(1, ...values);
+    const points = weeks
+      .map((week, index) => ({
+        x: index * WEEK_WIDTH + WEEK_WIDTH / 2,
+        y: lineChartHeight - chartBottomPadding - ((metricSeries?.get(week.key) || 0) / maxValue) * lineDrawableHeight,
+        value: metricSeries?.get(week.key) || 0,
+      }))
+      .filter((point) => point.value > 0);
+
+    return (
+      <View key={block.id} style={styles.analysisBlockCard}>
+        <View style={styles.analysisCardSurface}>
+          <View style={styles.analysisBlockHeader}>
+            <View style={styles.analysisBlockHeaderText}>
+              <Text style={styles.analysisBlockTitle}>{blockTitle(block)}</Text>
+              <Text style={styles.analysisBlockSubtitle}>{exerciseLabel}</Text>
+            </View>
+            <Pressable onPress={() => removeBlock(block.id)} hitSlop={8} style={styles.analysisBlockRemove}>
+              <MaterialCommunityIcons name="close" size={22} color="#9AAEC0" />
+            </Pressable>
+          </View>
+          <View style={styles.analysisControlRow}>
+            <Button
+              mode="outlined"
+              compact
+              textColor="#90CAF9"
+              icon="chevron-down"
+              onPress={() => {
+                setProgressionPickerTargetBlockId(block.id);
+                setProgressionExercisePickerOpen(true);
+              }}
+            >
+              Byt övning
+            </Button>
+          </View>
+        <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.analysisMetricRow} contentContainerStyle={styles.analysisMetricRowContent}>
+          {(['topWeight', 'totalSets'] as ProgressMetric[]).map((metric) => {
+            const active = progressMetric === metric;
+            return (
+              <Pressable
+                key={metric}
+                style={[styles.chip, styles.analysisMetricChip, active && styles.chipActive]}
+                onPress={() =>
+                  setAnalysisBlocks((prev) => prev.map((item) => (
+                    item.id === block.id ? { ...item, progressMetric: metric } : item
+                  )))
+                }
+              >
+                <Text style={[styles.chipText, active && styles.chipTextActive]}>{progressMetricLabel(metric)}</Text>
+              </Pressable>
+            );
+          })}
+        </ScrollView>
+        <Text style={styles.analysisRangeText}>{headerLabelByBlockId[block.id] ?? weeks[weeks.length - 1]?.headerLabel}</Text>
+        <View style={styles.analysisChartWrap}>
+          <ScrollView
+            horizontal
+            ref={(ref: any) => { scrollRefsByBlockId.current[block.id] = ref; }}
+            showsHorizontalScrollIndicator={false}
+            onScroll={(event) => {
+              const viewportW = event.nativeEvent.layoutMeasurement?.width ?? viewportWidth;
+              const centerIndex = Math.round((event.nativeEvent.contentOffset.x + viewportW / 2) / WEEK_WIDTH);
+              const week = weeks[Math.max(0, Math.min(weeks.length - 1, centerIndex))];
+              setHeaderLabelByBlockId((prev) => ({ ...prev, [block.id]: week.headerLabel }));
+            }}
+            onLayout={(event) => {
+              const width = event.nativeEvent.layout.width;
+              const currentIndex = weeks.length - 1;
+              const x = Math.max(currentIndex * WEEK_WIDTH - width / 2 + WEEK_WIDTH / 2, 0);
+              setTimeout(() => scrollRefsByBlockId.current[block.id]?.scrollTo({ x, animated: false }), 50);
+            }}
+            scrollEventThrottle={16}
+          >
+            <View>
+              <Svg width={weeks.length * WEEK_WIDTH} height={lineChartHeight}>
+                {weeks.map((week, index) => (
+                  <Line
+                    key={`${week.key}-grid`}
+                    x1={index * WEEK_WIDTH}
+                    y1={0}
+                    x2={index * WEEK_WIDTH}
+                    y2={lineChartHeight - 30}
+                    stroke="#22313D"
+                  />
+                ))}
+                {points.length > 0 ? (
+                  <>
+                    <Path d={createCurvePath(points)} stroke="#90CAF9" strokeWidth={3} fill="none" />
+                    {points.map((point, index) => (
+                      <Circle key={`${block.id}-point-${index}`} cx={point.x} cy={point.y} r={4.5} fill="#90CAF9" />
+                    ))}
+                  </>
+                ) : null}
+              </Svg>
+              <View style={styles.weekAxisRow}>
+                {weeks.map((week) => (
+                  <View key={`${week.key}-axis`} style={styles.weekAxisItem}>
+                    <Text style={styles.axisWeek}>{week.label}</Text>
+                    <Text style={styles.axisDate}>{shortDate(week.start)}</Text>
+                  </View>
+                ))}
+              </View>
+            </View>
+          </ScrollView>
+          {points.length === 0 ? <Text style={styles.analysisNoDataText}>Ingen träningsdata för vald övning ännu.</Text> : null}
+          <Text style={styles.chartHelpText}>{helpTextByType(block)}</Text>
+        </View>
+        </View>
+      </View>
+    );
+  };
+
+  const renderMuscleGroupCard = (block: AnalysisBlock) => {
+    const metric = block.muscleMetric ?? 'sets';
+    const source = metric === 'sets' ? muscleGroupWeeklySets : muscleGroupWeeklyVolume;
+    const values = weeks.map((week) => source.get(block.muscleGroupTag || '')?.get(week.key) || 0);
+    const headerText = headerLabelByBlockId[block.id] ?? weeks[weeks.length - 1]?.headerLabel;
+    return (
+      <View key={block.id} style={styles.analysisBlockCard}>
+        <View style={styles.analysisCardSurface}>
+          <View style={styles.analysisBlockHeader}>
+            <View style={styles.analysisBlockHeaderText}>
+              <Text style={styles.analysisBlockTitle}>{blockTitle(block)}</Text>
+              <Text style={styles.analysisBlockSubtitle}>{block.muscleGroupTag}</Text>
+            </View>
+            <Pressable onPress={() => removeBlock(block.id)} hitSlop={8} style={styles.analysisBlockRemove}>
+              <MaterialCommunityIcons name="close" size={22} color="#9AAEC0" />
+            </Pressable>
+          </View>
+        <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.analysisMetricRow} contentContainerStyle={styles.analysisMetricRowContent}>
+          {(['sets', 'volume'] as MuscleMetric[]).map((option) => {
+            const active = metric === option;
+            return (
+              <Pressable
+                key={option}
+                style={[styles.chip, styles.analysisMetricChip, active && styles.chipActive]}
+                onPress={() =>
+                  setAnalysisBlocks((prev) => prev.map((item) => (
+                    item.id === block.id ? { ...item, muscleMetric: option } : item
+                  )))
+                }
+              >
+                <Text style={[styles.chipText, active && styles.chipTextActive]}>{muscleMetricLabel(option)}</Text>
+              </Pressable>
+            );
+          })}
+        </ScrollView>
+        <Text style={styles.analysisRangeText}>{headerText}</Text>
+        <View style={styles.analysisChartWrap}>
+          <ScrollView
+            horizontal
+            ref={(ref: any) => { scrollRefsByBlockId.current[block.id] = ref; }}
+            showsHorizontalScrollIndicator={false}
+            onScroll={(event) => {
+              const viewportW = event.nativeEvent.layoutMeasurement?.width ?? viewportWidth;
+              const centerIndex = Math.round((event.nativeEvent.contentOffset.x + viewportW / 2) / WEEK_WIDTH);
+              const week = weeks[Math.max(0, Math.min(weeks.length - 1, centerIndex))];
+              setHeaderLabelByBlockId((prev) => ({ ...prev, [block.id]: week.headerLabel }));
+            }}
+            onLayout={(event) => {
+              const width = event.nativeEvent.layout.width;
+              const currentIndex = weeks.length - 1;
+              const x = Math.max(currentIndex * WEEK_WIDTH - width / 2 + WEEK_WIDTH / 2, 0);
+              setTimeout(() => scrollRefsByBlockId.current[block.id]?.scrollTo({ x, animated: false }), 50);
+            }}
+            scrollEventThrottle={16}
+          >
+            <View>
+              <Svg width={weeks.length * WEEK_WIDTH} height={chartHeight}>
+                {weeks.map((week, index) => (
+                  <Line
+                    key={`${week.key}-grid`}
+                    x1={index * WEEK_WIDTH}
+                    y1={0}
+                    x2={index * WEEK_WIDTH}
+                    y2={chartHeight - 30}
+                    stroke="#22313D"
+                  />
+                ))}
+                {renderWeeklyBarChart(values, '#81C784')}
+              </Svg>
+              <View style={styles.weekAxisRow}>
+                {weeks.map((week) => (
+                  <View key={`${week.key}-axis`} style={styles.weekAxisItem}>
+                    <Text style={styles.axisWeek}>{week.label}</Text>
+                    <Text style={styles.axisDate}>{shortDate(week.start)}</Text>
+                  </View>
+                ))}
+              </View>
+            </View>
+          </ScrollView>
+          <Text style={styles.chartHelpText}>{helpTextByType(block)}</Text>
+          <View style={styles.chartLegend}>
+            <View style={styles.chartLegendItem}>
+              <View style={[styles.dot, { backgroundColor: '#81C784' }]} />
+              <Text style={styles.chartLegendText}>{block.muscleGroupTag}</Text>
+            </View>
+          </View>
+        </View>
+        </View>
+      </View>
+    );
+  };
+
+  const renderDistributionCard = (block: AnalysisBlock) => {
+    const metric = block.distributionMetric ?? 'sets';
+    const slices = distributionSlicesByMetric[metric];
+    const total = slices.reduce((sum, slice) => sum + slice.value, 0);
+    let angleCursor = 0;
+
+    return (
+      <View key={block.id} style={styles.analysisBlockCard}>
+        <View style={styles.analysisCardSurface}>
+          <View style={styles.analysisBlockHeader}>
+            <View style={styles.analysisBlockHeaderText}>
+              <Text style={styles.analysisBlockTitle}>{blockTitle(block)}</Text>
+              <Text style={styles.analysisBlockSubtitle}>Senaste {weeks.length} veckorna</Text>
+            </View>
+            <Pressable onPress={() => removeBlock(block.id)} hitSlop={8} style={styles.analysisBlockRemove}>
+              <MaterialCommunityIcons name="close" size={22} color="#9AAEC0" />
+            </Pressable>
+          </View>
+        <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.analysisMetricRow} contentContainerStyle={styles.analysisMetricRowContent}>
+          {(['sets', 'volume'] as DistributionMetric[]).map((option) => {
+            const active = metric === option;
+            return (
+              <Pressable
+                key={option}
+                style={[styles.chip, styles.analysisMetricChip, active && styles.chipActive]}
+                onPress={() =>
+                  setAnalysisBlocks((prev) => prev.map((item) => (
+                    item.id === block.id ? { ...item, distributionMetric: option } : item
+                  )))
+                }
+              >
+                <Text style={[styles.chipText, active && styles.chipTextActive]}>{muscleMetricLabel(option)}</Text>
+              </Pressable>
+            );
+          })}
+        </ScrollView>
+        <View style={styles.analysisPieCard}>
+          <Svg width={220} height={220}>
+            {total > 0 ? (
+              slices.length === 1 ? (
+                <Circle cx={110} cy={110} r={86} fill={slices[0].color} />
+              ) : (
+                slices.map((slice) => {
+                  const sliceAngle = (slice.value / total) * 360;
+                  const startAngle = angleCursor;
+                  const endAngle = angleCursor + sliceAngle;
+                  angleCursor = endAngle;
+                  return (
+                    <Path
+                      key={slice.label}
+                      d={describePieSlice(110, 110, 86, startAngle, endAngle)}
+                      fill={slice.color}
+                    />
+                  );
+                })
+              )
+            ) : null}
+            {total > 0 ? <Circle cx={110} cy={110} r={34} fill="#151D26" /> : null}
+          </Svg>
+          {total === 0 ? <Text style={styles.analysisNoDataText}>Ingen data för fördelning ännu.</Text> : null}
+          <Text style={styles.chartHelpText}>{helpTextByType(block)}</Text>
+          <View style={styles.analysisPieLegend}>
+            {slices.map((slice) => (
+              <View key={slice.label} style={styles.analysisPieLegendRow}>
+                <View style={styles.analysisPieLegendLabelWrap}>
+                  <View style={[styles.dot, { backgroundColor: slice.color }]} />
+                  <Text style={styles.chartLegendText}>{slice.label}</Text>
+                </View>
+                <Text style={styles.analysisPieLegendValue}>
+                  {total > 0 ? `${Math.round((slice.value / total) * 100)}%` : '0%'}
+                </Text>
+              </View>
+            ))}
+          </View>
+        </View>
+        </View>
+      </View>
+    );
+  };
+
+  return (
+    <View style={[styles.screen, { paddingTop: insets.top }]}>
+      <RNScrollView style={{ flex: 1 }} contentContainerStyle={styles.analysisScrollContent} showsVerticalScrollIndicator={false}>
+        <Text style={styles.screenTitle}>Analys</Text>
+
+        {visibleBlocks.length === 0 ? (
+          <View style={styles.analysisEmptyCard}>
+            <MaterialCommunityIcons name="chart-box-outline" size={42} color="#8FA1B3" />
+            <Text style={styles.analysisEmptyTitle}>Inga analyser ännu</Text>
+            <Text style={styles.analysisEmptyText}>Tryck på plusset för att lägga till en analys här.</Text>
+          </View>
+        ) : null}
+
+        {visibleBlocks.map((block) => {
+          if (block.type === 'rehabFrequency') return renderRehabCard(block);
+          if (block.type === 'exerciseProgression') return renderProgressionCard(block);
+          if (block.type === 'muscleGroupBars') return renderMuscleGroupCard(block);
+          return renderDistributionCard(block);
+        })}
+      </RNScrollView>
+
+      <Modal visible={analysisPickerOpen} transparent animationType="fade" onRequestClose={() => setAnalysisPickerOpen(false)}>
+        <View style={styles.timePickerBackdrop}>
+          <View style={[styles.timePickerCard, styles.analysisModalCard]}>
+            <View style={styles.analysisModalHeader}>
+              <Text style={styles.timePickerTitle}>Lägg till analys</Text>
+              <Pressable style={styles.analysisModalCloseButton} onPress={() => setAnalysisPickerOpen(false)}>
+                <MaterialIcons name="close" size={20} color="#DCE4EC" />
+              </Pressable>
+            </View>
+            <RNScrollView style={styles.analysisModalList} showsVerticalScrollIndicator={false}>
+              <Pressable style={styles.analysisOptionCard} onPress={() => addBlock({ id: createBlockId(), type: 'rehabFrequency' })}>
+                <Text style={styles.analysisOptionTitle}>Rehab-frekvens</Text>
+                <Text style={styles.analysisOptionText}>Behåller stapeldiagrammet för dina dagliga övningar.</Text>
+              </Pressable>
+              <Pressable
+                style={styles.analysisOptionCard}
+                onPress={() => {
+                  setAnalysisPickerOpen(false);
+                  setProgressionPickerTargetBlockId(null);
+                  setProgressionExercisePickerOpen(true);
+                }}
+              >
+                <Text style={styles.analysisOptionTitle}>Övningsprogression</Text>
+                <Text style={styles.analysisOptionText}>Linjediagram för tyngsta vikt eller totala set per vecka.</Text>
+              </Pressable>
+              <Pressable
+                style={styles.analysisOptionCard}
+                onPress={() => {
+                  setAnalysisPickerOpen(false);
+                  setMuscleGroupPickerOpen(true);
+                }}
+              >
+                <Text style={styles.analysisOptionTitle}>Muskelgrupp</Text>
+                <Text style={styles.analysisOptionText}>Veckovisa staplar för set eller volym per muskelgrupp.</Text>
+              </Pressable>
+              <Pressable style={styles.analysisOptionCard} onPress={() => addBlock({ id: createBlockId(), type: 'distributionPie', distributionMetric: 'sets' })}>
+                <Text style={styles.analysisOptionTitle}>Fördelning</Text>
+                <Text style={styles.analysisOptionText}>Cirkeldiagram som visar andel set eller volym per muskelgrupp.</Text>
+              </Pressable>
+            </RNScrollView>
+            <View style={styles.timePickerActions}>
+              <Button onPress={() => setAnalysisPickerOpen(false)}>Stäng</Button>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal visible={progressionExercisePickerOpen} transparent animationType="fade" onRequestClose={() => { setProgressionExercisePickerOpen(false); setProgressionPickerTargetBlockId(null); }}>
+        <View style={styles.timePickerBackdrop}>
+          <View style={[styles.timePickerCard, styles.analysisModalCard]}>
+            <View style={styles.analysisModalHeader}>
+              <Text style={styles.timePickerTitle}>Välj övning</Text>
+              <Pressable style={styles.analysisModalCloseButton} onPress={() => { setProgressionExercisePickerOpen(false); setProgressionPickerTargetBlockId(null); }}>
+                <MaterialIcons name="close" size={20} color="#DCE4EC" />
+              </Pressable>
+            </View>
+            <RNScrollView style={styles.analysisModalList} showsVerticalScrollIndicator={false}>
+              {progressionOptions.map((option) => (
+                <Pressable
+                  key={option.key}
+                  style={styles.analysisOptionCard}
+                  onPress={() => {
+                    if (progressionPickerTargetBlockId) {
+                      updateProgressionExercise(progressionPickerTargetBlockId, option.key);
+                      return;
+                    }
+                    addBlock({
+                      id: createBlockId(),
+                      type: 'exerciseProgression',
+                      exerciseKey: option.key,
+                      progressMetric: 'topWeight',
+                    });
+                  }}
+                >
+                  <Text style={styles.analysisOptionTitle}>{option.label}</Text>
+                  <Text style={styles.analysisOptionText}>
+                    {progressionPickerTargetBlockId ? 'Byt grafen till denna övning.' : 'Startar med metricen tyngsta vikt.'}
+                  </Text>
+                </Pressable>
+              ))}
+            </RNScrollView>
+            <View style={styles.timePickerActions}>
+              <Button onPress={() => { setProgressionExercisePickerOpen(false); setProgressionPickerTargetBlockId(null); }}>Stäng</Button>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal visible={muscleGroupPickerOpen} transparent animationType="fade" onRequestClose={() => setMuscleGroupPickerOpen(false)}>
+        <View style={styles.timePickerBackdrop}>
+          <View style={[styles.timePickerCard, styles.analysisModalCard]}>
+            <View style={styles.analysisModalHeader}>
+              <Text style={styles.timePickerTitle}>Välj muskelgrupp</Text>
+              <Pressable style={styles.analysisModalCloseButton} onPress={() => setMuscleGroupPickerOpen(false)}>
+                <MaterialIcons name="close" size={20} color="#DCE4EC" />
+              </Pressable>
+            </View>
+            <RNScrollView style={styles.analysisModalList} showsVerticalScrollIndicator={false}>
+              {muscleGroupTags.map((tag) => (
+                <Pressable
+                  key={tag}
+                  style={styles.analysisOptionCard}
+                  onPress={() => addBlock({
+                    id: createBlockId(),
+                    type: 'muscleGroupBars',
+                    muscleGroupTag: tag,
+                    muscleMetric: 'sets',
+                  })}
+                >
+                  <Text style={styles.analysisOptionTitle}>{tag}</Text>
+                  <Text style={styles.analysisOptionText}>Startar med metricen set per vecka.</Text>
+                </Pressable>
+              ))}
+            </RNScrollView>
+            <View style={styles.timePickerActions}>
+              <Button onPress={() => setMuscleGroupPickerOpen(false)}>Stäng</Button>
+            </View>
+          </View>
+        </View>
+      </Modal>
     </View>
   );
 }
@@ -3022,6 +4920,12 @@ function DiaryScreen({
   const logWrapY = useRef(0);
   const suppressNextDeselect = useRef(false);
   const diaryScrollY = useRef(0);
+  const diaryTitleScrollY = useRef(new Animated.Value(0)).current;
+  const diaryTitleOpacity = diaryTitleScrollY.interpolate({
+    inputRange: [0, TITLE_FADE_SCROLL_DISTANCE],
+    outputRange: [1, 0],
+    extrapolate: 'clamp',
+  });
   const chartTouchStart = useRef<{ x: number; y: number } | null>(null);
   const chartTouchMoved = useRef(false);
   const prevPointsLengthRef = useRef(0);
@@ -3099,15 +5003,19 @@ function DiaryScreen({
 
   return (
     <View style={[styles.screen, { paddingTop: insets.top }]}>
-      <Text style={styles.screenTitleSmall}>Dagbok</Text>
+      <View style={[styles.titleOverlay, { paddingTop: insets.top, paddingHorizontal: 16 }]}>
+        <Animated.Text style={[styles.screenTitle, { opacity: diaryTitleOpacity }]}>Dagbok</Animated.Text>
+      </View>
       <RNScrollView
         ref={diaryScrollRef}
-        contentContainerStyle={styles.listContent}
+        style={{ flex: 1 }}
+        contentContainerStyle={[styles.listContent, { paddingTop: TITLE_FADE_SCROLL_DISTANCE }]}
         scrollEnabled={!scrollLocked}
         nestedScrollEnabled
-        onScroll={(event) => {
-          diaryScrollY.current = event.nativeEvent.contentOffset.y;
-        }}
+        onScroll={Animated.event(
+          [{ nativeEvent: { contentOffset: { y: diaryTitleScrollY } } }],
+          { useNativeDriver: false, listener: (e: any) => { diaryScrollY.current = e.nativeEvent.contentOffset.y; } },
+        )}
         scrollEventThrottle={16}
       >
         {series.map((item) => (
@@ -3337,10 +5245,13 @@ function FloatingTabBar({
   navigation: { emit: (opts: { type: 'tabPress'; target: string; canPreventDefault: true }) => { defaultPrevented: boolean }; navigate: (name: string) => void };
   hasActiveWorkout: boolean;
 }) {
+  const insets = useSafeAreaInsets();
   const [tabBarWidth, setTabBarWidth] = useState(0);
   const pillTranslateX = useRef(new Animated.Value(0)).current;
   const prevIndexRef = useRef(state.index);
   const workoutPulseAnim = useRef(new Animated.Value(0)).current;
+  const tabItemCentersRef = useRef<number[]>([]);
+  const tabBarBottom = Math.max(insets.bottom + 10, 28);
 
   useEffect(() => {
     if (!hasActiveWorkout) {
@@ -3358,6 +5269,8 @@ function FloatingTabBar({
   }, [hasActiveWorkout, workoutPulseAnim]);
 
   const getPillTranslateX = useCallback((index: number) => {
+    const measuredCenter = tabItemCentersRef.current[index];
+    if (typeof measuredCenter === 'number') return measuredCenter - TAB_PILL_WIDTH / 2;
     if (tabBarWidth <= 0) return 0;
     const contentWidth = tabBarWidth - TAB_BAR_PADDING_H * 2;
     const tabWidth = contentWidth / state.routes.length;
@@ -3390,49 +5303,130 @@ function FloatingTabBar({
     }
   }, [state.index, state.routes.length, tabBarWidth, pillTranslateX]);
 
+  const handleTabItemLayout = useCallback((index: number, e: { nativeEvent: { layout: { x: number; width: number } } }) => {
+    const { x, width } = e.nativeEvent.layout;
+    if (width <= 0) return;
+    const centerX = x + width / 2;
+    const prevCenter = tabItemCentersRef.current[index];
+    if (typeof prevCenter !== 'number' || Math.abs(prevCenter - centerX) > 0.5) {
+      tabItemCentersRef.current[index] = centerX;
+      if (index === state.index) {
+        pillTranslateX.setValue(centerX - TAB_PILL_WIDTH / 2);
+      }
+    }
+  }, [state.index, pillTranslateX]);
+
   return (
-    <View style={styles.floatingTabBarOuter} pointerEvents="box-none">
-      <View style={styles.floatingTabBar} onLayout={handleLayout}>
-        <Animated.View
-          style={[
-            styles.floatingTabPillSliding,
-            { transform: [{ translateX: pillTranslateX }] },
-          ]}
-          pointerEvents="none"
-        />
-        {state.routes.map((route, index) => {
-          const isFocused = state.index === index;
-          const iconColor = isFocused ? '#1A222C' : '#90A4B8';
-          const IconComponent = route.name === 'Träning' ? MaterialCommunityIcons : MaterialIcons;
-          const iconName =
-            route.name === 'Hem' ? 'home'
-            : route.name === 'Analys' ? 'bar-chart'
-            : route.name === 'Träning' ? 'dumbbell'
-            : 'menu-book';
-          return (
-            <Pressable
-              key={route.key}
-              accessibilityRole="button"
-              accessibilityState={isFocused ? { selected: true } : {}}
-              onPress={() => {
-                const event = navigation.emit({ type: 'tabPress', target: route.key, canPreventDefault: true });
-                if (!isFocused && !event.defaultPrevented) navigation.navigate(route.name as never);
-              }}
-              style={styles.floatingTabBarItem}
-            >
-              <View style={styles.floatingTabPill}>
-                {route.name === 'Träning' && hasActiveWorkout ? (
-                  <Animated.View
-                    style={[styles.workoutActiveRing, { opacity: workoutPulseAnim }]}
-                    pointerEvents="none"
-                  />
-                ) : null}
-                <IconComponent name={iconName as never} size={24} color={iconColor} />
-              </View>
-            </Pressable>
-          );
-        })}
-      </View>
+    <View style={[styles.floatingTabBarOuter, { bottom: tabBarBottom }]} pointerEvents="box-none">
+      {Platform.OS === 'ios' ? (
+        <View style={[styles.floatingTabBar, styles.iosBlurFallback]} onLayout={handleLayout}>
+          <View style={styles.floatingTabBarGlassOverlay} pointerEvents="none" />
+          <Animated.View
+            style={[
+              styles.floatingTabPillSliding,
+              { transform: [{ translateX: pillTranslateX }] },
+            ]}
+            pointerEvents="none"
+          />
+          {state.routes.map((route, index) => {
+            const isFocused = state.index === index;
+            const iconColor = isFocused ? '#1A222C' : '#90A4B8';
+            const IconComponent = route.name === 'Träning' ? MaterialCommunityIcons : MaterialIcons;
+            const isTrainingTab = route.name === 'Träning';
+            const iconName =
+              route.name === 'Hem' ? 'home'
+              : route.name === 'Analys' ? 'bar-chart'
+              : route.name === 'Träning' ? 'dumbbell'
+              : 'menu-book';
+            return (
+              <Pressable
+                key={route.key}
+                accessibilityRole="button"
+                accessibilityState={isFocused ? { selected: true } : {}}
+                onLayout={(e) => handleTabItemLayout(index, e)}
+                onPress={() => {
+                  const event = navigation.emit({ type: 'tabPress', target: route.key, canPreventDefault: true });
+                  if (!isFocused && !event.defaultPrevented) navigation.navigate(route.name as never);
+                }}
+                style={styles.floatingTabBarItem}
+              >
+                <View style={styles.floatingTabPill}>
+                  {isTrainingTab && hasActiveWorkout ? (
+                    <Animated.View
+                      style={[
+                        styles.workoutActiveRing,
+                        styles.trainingTabOpticalOffset,
+                        { opacity: workoutPulseAnim },
+                      ]}
+                      pointerEvents="none"
+                    />
+                  ) : null}
+                  <View style={isTrainingTab ? styles.trainingTabOpticalOffset : undefined}>
+                    <IconComponent name={iconName as never} size={24} color={iconColor} />
+                  </View>
+                </View>
+              </Pressable>
+            );
+          })}
+        </View>
+      ) : (
+        <BlurView
+          intensity={72}
+          tint="dark"
+          experimentalBlurMethod="dimezisBlurView"
+          style={styles.floatingTabBar}
+          onLayout={handleLayout}
+        >
+          <View style={styles.floatingTabBarGlassOverlay} pointerEvents="none" />
+          <Animated.View
+            style={[
+              styles.floatingTabPillSliding,
+              { transform: [{ translateX: pillTranslateX }] },
+            ]}
+            pointerEvents="none"
+          />
+          {state.routes.map((route, index) => {
+            const isFocused = state.index === index;
+            const iconColor = isFocused ? '#1A222C' : '#90A4B8';
+            const IconComponent = route.name === 'Träning' ? MaterialCommunityIcons : MaterialIcons;
+            const isTrainingTab = route.name === 'Träning';
+            const iconName =
+              route.name === 'Hem' ? 'home'
+              : route.name === 'Analys' ? 'bar-chart'
+              : route.name === 'Träning' ? 'dumbbell'
+              : 'menu-book';
+            return (
+              <Pressable
+                key={route.key}
+                accessibilityRole="button"
+                accessibilityState={isFocused ? { selected: true } : {}}
+                onLayout={(e) => handleTabItemLayout(index, e)}
+                onPress={() => {
+                  const event = navigation.emit({ type: 'tabPress', target: route.key, canPreventDefault: true });
+                  if (!isFocused && !event.defaultPrevented) navigation.navigate(route.name as never);
+                }}
+                style={styles.floatingTabBarItem}
+              >
+                <View style={styles.floatingTabPill}>
+                  {isTrainingTab && hasActiveWorkout ? (
+                    <Animated.View
+                      style={[
+                        styles.workoutActiveRing,
+                        styles.trainingTabOpticalOffset,
+                        { opacity: workoutPulseAnim },
+                      ]}
+                      pointerEvents="none"
+                    />
+                  ) : null}
+                  <View style={isTrainingTab ? styles.trainingTabOpticalOffset : undefined}>
+                    <IconComponent name={iconName as never} size={24} color={iconColor} />
+                  </View>
+                </View>
+              </Pressable>
+            );
+          })}
+        </BlurView>
+      )}
     </View>
   );
 }
@@ -3507,6 +5501,7 @@ export default function App() {
   const [rehabCategoryCustomInput, setRehabCategoryCustomInput] = useState('');
   const [isHydrated, setIsHydrated] = useState(false);
   const trainingFabActionRef = useRef<(() => void) | null>(null);
+  const analysisPlusActionRef = useRef<(() => void) | null>(null);
   const [hasActiveWorkout, setHasActiveWorkout] = useState(false);
   const librarySheetMaxDrag = Math.round(Dimensions.get('window').height * 0.92);
   const librarySheetTranslateY = useRef(new Animated.Value(0)).current;
@@ -3752,20 +5747,29 @@ export default function App() {
   const gymLibraryExercisesRef = useRef(gymLibraryExercises);
   gymLibraryExercisesRef.current = gymLibraryExercises;
 
-  /* ── Notification: request Android permissions ── */
+  /* ── Notification: request platform notification permissions ── */
   useEffect(() => {
     (async () => {
-      if (!Device.isDevice || Platform.OS !== 'android') return;
-      await requestAndroidNotificationPermission();
-      await ensureAndroidExactAlarmPermission();
+      if (!Device.isDevice) return;
+      if (Platform.OS === 'android') {
+        await requestAndroidNotificationPermission();
+        await ensureAndroidExactAlarmPermission();
+        return;
+      }
+      if (Platform.OS === 'ios') {
+        await requestIosNotificationPermission();
+        await ensureIosNotificationCategoryConfigured();
+      }
     })();
   }, []);
 
-  /* ── Android native notifications: consume actions done while app was backgrounded ── */
+  /* ── Platform notifications: consume actions done while app was backgrounded ── */
   useEffect(() => {
-    if (!isHydrated || Platform.OS !== 'android') return;
+    if (!isHydrated) return;
     (async () => {
-      const pending = await consumeAndroidPendingCompletions().catch(() => []);
+      const pending = Platform.OS === 'android'
+        ? await consumeAndroidPendingCompletions().catch(() => [])
+        : await consumeIosPendingCompletions().catch(() => []);
       if (!Array.isArray(pending) || pending.length === 0) return;
       const incoming: ExerciseLog[] = pending
         .filter((row) => row?.exerciseId && row?.atIso)
@@ -3817,6 +5821,17 @@ export default function App() {
               setLogs(freshLogs);
             }
           }
+        } else if (Platform.OS === 'ios') {
+          const pending = await consumeIosPendingCompletions().catch(() => []);
+          if (Array.isArray(pending) && pending.length > 0) {
+            const incoming: ExerciseLog[] = pending
+              .filter((row) => row?.exerciseId && row?.atIso)
+              .map((row) => ({ exerciseId: row.exerciseId, atIso: row.atIso }));
+            if (incoming.length > 0) {
+              freshLogs = mergeLogs(freshLogs, incoming);
+              setLogs(freshLogs);
+            }
+          }
         }
         scheduleExerciseNotifications(exercisesRef.current).catch((error) => {
           console.warn('[notifications] app-active schedule failed:', error);
@@ -3825,6 +5840,43 @@ export default function App() {
     });
     return () => subscription.remove();
   }, [isHydrated]);
+
+  useEffect(() => {
+    if (Platform.OS !== 'ios') return;
+
+    const flushIosPending = async () => {
+      const pending = await consumeIosPendingCompletions().catch(() => []);
+      if (!Array.isArray(pending) || pending.length === 0) return;
+      const incoming: ExerciseLog[] = pending
+        .filter((row) => row?.exerciseId && row?.atIso)
+        .map((row) => ({ exerciseId: row.exerciseId, atIso: row.atIso }));
+      if (incoming.length === 0) return;
+      setLogs((prev) => mergeLogs(prev, incoming));
+    };
+
+    const onResponse = async (response: Notifications.NotificationResponse) => {
+      await handleIosNotificationResponse(response);
+      await flushIosPending();
+    };
+
+    const subscription = Notifications.addNotificationResponseReceivedListener((response) => {
+      onResponse(response).catch((error) => {
+        console.warn('[notifications] iOS action handling failed:', error);
+      });
+    });
+
+    (async () => {
+      const lastResponse = await Notifications.getLastNotificationResponseAsync().catch(() => null);
+      if (lastResponse) {
+        await onResponse(lastResponse).catch((error) => {
+          console.warn('[notifications] iOS initial action handling failed:', error);
+        });
+        await Notifications.clearLastNotificationResponseAsync().catch(() => {});
+      }
+    })();
+
+    return () => subscription.remove();
+  }, []);
 
   const closeTimePicker = () => setTimePickerIndex(null);
   const setTrainingFabAction = useCallback((action: (() => void) | null) => {
@@ -4040,6 +6092,10 @@ export default function App() {
       trainingFabActionRef.current?.();
       return;
     }
+    if (activeTab === 'Analys') {
+      analysisPlusActionRef.current?.();
+      return;
+    }
     if (activeTab === 'Dagbok') {
       setNewSeriesDialog(true);
     }
@@ -4135,7 +6191,17 @@ export default function App() {
               <Tab.Screen name="Analys" options={{ title: 'Analys' }}>
                 {() => (
                   <AnimatedTabScreen>
-                    <AnalysisScreen exercises={exercises} logs={logs} />
+                    <AnalysisScreen
+                      exercises={exercises}
+                      logs={logs}
+                      completedWorkouts={completedWorkouts}
+                      exerciseWeightPbs={exerciseWeightPbs}
+                      workoutPlans={workoutPlans}
+                      gymLibraryExercises={gymLibraryExercises}
+                      onPlusActionChange={(action) => {
+                        analysisPlusActionRef.current = action;
+                      }}
+                    />
                   </AnimatedTabScreen>
                 )}
               </Tab.Screen>
@@ -4556,67 +6622,66 @@ export default function App() {
                   </Button>
                 )}
               </View>
-            </View>
-          </View>
-        </Modal>
-
-        <Modal visible={timePickerIndex !== null} transparent animationType="fade" onRequestClose={closeTimePicker}>
-          <View style={styles.timePickerBackdrop}>
-            <Pressable style={styles.backdropTapZone} onPress={closeTimePicker} />
-            <View style={styles.timePickerCard}>
-              <Text style={styles.timePickerTitle}>
-                {timePickerIndex !== null ? `Välj tid ${timePickerIndex + 1}` : 'Välj tid'}
-              </Text>
-              <View style={styles.timePickerStepRow}>
-                <Text style={styles.wizardFieldLabel}>Timme</Text>
-                <View style={styles.numberStepperRow}>
-                  <Pressable style={styles.stepperButton} onPress={() => setTimeDraftHour((prev) => (prev - 1 + 24) % 24)}>
-                    <Text style={styles.stepperButtonText}>-</Text>
-                  </Pressable>
-                  <View style={styles.stepperValueBox}>
-                    <Text style={styles.stepperValueText}>{String(timeDraftHour).padStart(2, '0')}</Text>
+              {timePickerIndex !== null ? (
+                <View style={[styles.timePickerBackdrop, styles.wizardTimePickerOverlay]}>
+                  <Pressable style={styles.backdropTapZone} onPress={closeTimePicker} />
+                  <View style={styles.timePickerCard}>
+                    <Text style={styles.timePickerTitle}>
+                      {timePickerIndex !== null ? `Välj tid ${timePickerIndex + 1}` : 'Välj tid'}
+                    </Text>
+                    <View style={styles.timePickerStepRow}>
+                      <Text style={styles.wizardFieldLabel}>Timme</Text>
+                      <View style={styles.numberStepperRow}>
+                        <Pressable style={styles.stepperButton} onPress={() => setTimeDraftHour((prev) => (prev - 1 + 24) % 24)}>
+                          <Text style={styles.stepperButtonText}>-</Text>
+                        </Pressable>
+                        <View style={styles.stepperValueBox}>
+                          <Text style={styles.stepperValueText}>{String(timeDraftHour).padStart(2, '0')}</Text>
+                        </View>
+                        <Pressable style={styles.stepperButton} onPress={() => setTimeDraftHour((prev) => (prev + 1) % 24)}>
+                          <Text style={styles.stepperButtonText}>+</Text>
+                        </Pressable>
+                      </View>
+                    </View>
+                    <View style={styles.timePickerStepRow}>
+                      <Text style={styles.wizardFieldLabel}>Minut</Text>
+                      <View style={styles.numberStepperRow}>
+                        <Pressable style={styles.stepperButton} onPress={() => setTimeDraftMinute((prev) => (prev - 5 + 60) % 60)}>
+                          <Text style={styles.stepperButtonText}>-</Text>
+                        </Pressable>
+                        <View style={styles.stepperValueBox}>
+                          <Text style={styles.stepperValueText}>{String(timeDraftMinute).padStart(2, '0')}</Text>
+                        </View>
+                        <Pressable style={styles.stepperButton} onPress={() => setTimeDraftMinute((prev) => (prev + 5) % 60)}>
+                          <Text style={styles.stepperButtonText}>+</Text>
+                        </Pressable>
+                      </View>
+                    </View>
+                    <Text style={styles.timePreviewText}>
+                      Vald tid: {String(timeDraftHour).padStart(2, '0')}:{String(timeDraftMinute).padStart(2, '0')}
+                    </Text>
+                    <View style={styles.timePickerActions}>
+                      <Button onPress={closeTimePicker}>Avbryt</Button>
+                      <Button
+                        mode="contained"
+                        onPress={() => {
+                          if (timePickerIndex === null) return;
+                          setWizardTimes((prev) =>
+                            prev.map((time, idx) =>
+                              idx === timePickerIndex
+                                ? `${String(timeDraftHour).padStart(2, '0')}:${String(timeDraftMinute).padStart(2, '0')}`
+                                : time,
+                            ),
+                          );
+                          closeTimePicker();
+                        }}
+                      >
+                        Spara
+                      </Button>
+                    </View>
                   </View>
-                  <Pressable style={styles.stepperButton} onPress={() => setTimeDraftHour((prev) => (prev + 1) % 24)}>
-                    <Text style={styles.stepperButtonText}>+</Text>
-                  </Pressable>
                 </View>
-              </View>
-              <View style={styles.timePickerStepRow}>
-                <Text style={styles.wizardFieldLabel}>Minut</Text>
-                <View style={styles.numberStepperRow}>
-                  <Pressable style={styles.stepperButton} onPress={() => setTimeDraftMinute((prev) => (prev - 5 + 60) % 60)}>
-                    <Text style={styles.stepperButtonText}>-</Text>
-                  </Pressable>
-                  <View style={styles.stepperValueBox}>
-                    <Text style={styles.stepperValueText}>{String(timeDraftMinute).padStart(2, '0')}</Text>
-                  </View>
-                  <Pressable style={styles.stepperButton} onPress={() => setTimeDraftMinute((prev) => (prev + 5) % 60)}>
-                    <Text style={styles.stepperButtonText}>+</Text>
-                  </Pressable>
-                </View>
-              </View>
-              <Text style={styles.timePreviewText}>
-                Vald tid: {String(timeDraftHour).padStart(2, '0')}:{String(timeDraftMinute).padStart(2, '0')}
-              </Text>
-              <View style={styles.timePickerActions}>
-                <Button onPress={closeTimePicker}>Avbryt</Button>
-                <Button
-                  mode="contained"
-                  onPress={() => {
-                    if (timePickerIndex === null) return;
-                    setWizardTimes((prev) =>
-                      prev.map((time, idx) =>
-                        idx === timePickerIndex
-                          ? `${String(timeDraftHour).padStart(2, '0')}:${String(timeDraftMinute).padStart(2, '0')}`
-                          : time,
-                      ),
-                    );
-                    closeTimePicker();
-                  }}
-                >
-                  Spara
-                </Button>
-              </View>
+              ) : null}
             </View>
           </View>
         </Modal>
@@ -4688,22 +6753,33 @@ const styles = StyleSheet.create({
   floatingTabBar: {
     width: '90%',
     height: 78,
-    backgroundColor: '#151D26',
+    backgroundColor: 'rgba(21, 29, 38, 0.72)',
     borderRadius: 39,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-around',
     paddingHorizontal: 14,
+    overflow: 'hidden',
+    borderWidth: 1,
+    borderColor: 'rgba(214, 235, 255, 0.12)',
     elevation: 8,
     shadowColor: '#000',
     shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.22,
-    shadowRadius: 8,
+    shadowOpacity: 0.28,
+    shadowRadius: 14,
+  },
+  iosBlurFallback: {
+    backgroundColor: 'rgba(21, 29, 38, 0.92)',
+  },
+  floatingTabBarGlassOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: 'rgba(255, 255, 255, 0.05)',
   },
   floatingTabBarItem: {
     flex: 1,
     alignItems: 'center',
     justifyContent: 'center',
+    zIndex: 2,
   },
   floatingTabBarIconWrap: {
     height: '100%',
@@ -4716,6 +6792,9 @@ const styles = StyleSheet.create({
     borderRadius: 26,
     alignItems: 'center',
     justifyContent: 'center',
+  },
+  trainingTabOpticalOffset: {
+    transform: [{ translateX: 1 }, { translateY: 1.5 }],
   },
   workoutActiveRing: {
     position: 'absolute',
@@ -4734,7 +6813,9 @@ const styles = StyleSheet.create({
     width: TAB_PILL_WIDTH,
     height: TAB_PILL_HEIGHT,
     borderRadius: TAB_PILL_HEIGHT / 2,
-    backgroundColor: '#2563A8',
+    backgroundColor: 'rgba(82, 153, 230, 0.34)',
+    borderWidth: 1,
+    borderColor: 'rgba(183, 221, 255, 0.18)',
   },
   floatingTabPillActive: {
     backgroundColor: '#2563A8',
@@ -4759,6 +6840,7 @@ const styles = StyleSheet.create({
     shadowRadius: 10,
   },
   screen: { flex: 1, backgroundColor: '#0F1419' },
+  titleOverlay: { position: 'absolute', top: 0, left: 0, right: 0, zIndex: 10 },
   screenTitle: { color: '#E3EAF2', fontSize: 32, fontWeight: '800', paddingHorizontal: 16, paddingTop: 14, paddingBottom: 6 },
   minimalTriggerTestButton: { alignSelf: 'flex-start', marginHorizontal: 16, marginBottom: 8, paddingVertical: 6, paddingHorizontal: 12, backgroundColor: '#33414F', borderRadius: 8 },
   minimalTriggerTestText: { color: '#88C0D0', fontSize: 13 },
@@ -4961,6 +7043,7 @@ const styles = StyleSheet.create({
   wizardBottomSheet: { height: '74%' },
   wizardContentArea: { flex: 1, minHeight: 180 },
   wizardActions: { marginTop: 28, paddingBottom: 8, flexDirection: 'row', justifyContent: 'flex-end', gap: 8 },
+  wizardTimePickerOverlay: { position: 'absolute', top: 0, right: 0, bottom: 0, left: 0, zIndex: 20 },
   timePickerBackdrop: { flex: 1, backgroundColor: 'rgba(0, 0, 0, 0.62)', justifyContent: 'center', paddingHorizontal: 18 },
   timePickerCard: {
     backgroundColor: '#151D26',
@@ -4992,7 +7075,87 @@ const styles = StyleSheet.create({
   axisDate: { fontSize: 11, color: '#8FA1B3', textAlign: 'center', width: '100%' },
   axisIdag: { fontSize: 11, color: 'transparent', textAlign: 'center', width: '100%', minHeight: 14 },
   todayText: { fontWeight: '700', color: '#7FC8FF' },
-  chartHelpText: { marginTop: 6, color: '#9AAEC0', fontSize: 12, textAlign: 'center' },
+  chartHelpText: { marginTop: 10, color: '#9AAEC0', fontSize: 12, textAlign: 'center', lineHeight: 18 },
+  chartLegend: { flexDirection: 'row', flexWrap: 'wrap', marginTop: 8, paddingHorizontal: 4, gap: 10 },
+  chartLegendItem: { flexDirection: 'row', alignItems: 'center', gap: 6 },
+  chartLegendText: { fontSize: 12, color: '#9AAEC0', maxWidth: 120 },
+  analysisBlockCard: { marginHorizontal: 12, marginBottom: 16 },
+  analysisCardSurface: {
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: '#24313E',
+    backgroundColor: '#151D26',
+    paddingTop: 8,
+    paddingBottom: 12,
+  },
+  analysisBlockHeader: { flexDirection: 'row', alignItems: 'flex-start', justifyContent: 'space-between', paddingHorizontal: 14, paddingTop: 4 },
+  analysisBlockHeaderText: { flex: 1, paddingRight: 12 },
+  analysisBlockTitle: { fontSize: 21, fontWeight: '800', color: '#DCE4EC' },
+  analysisBlockSubtitle: { marginTop: 4, color: '#8FA1B3', fontSize: 13, lineHeight: 18 },
+  analysisBlockRemove: { padding: 4 },
+  analysisScrollContent: { paddingBottom: 140 },
+  analysisEmptyCard: {
+    marginHorizontal: 12,
+    marginTop: 14,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: '#24313E',
+    backgroundColor: '#151D26',
+    paddingHorizontal: 18,
+    paddingVertical: 28,
+    alignItems: 'center',
+    gap: 10,
+  },
+  analysisEmptyTitle: { color: '#E3EAF2', fontSize: 18, fontWeight: '700' },
+  analysisEmptyText: { color: '#9AAEC0', fontSize: 14, textAlign: 'center', lineHeight: 20 },
+  analysisModalCard: { maxHeight: '72%', paddingTop: 10 },
+  analysisModalHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 },
+  analysisModalCloseButton: { padding: 6, borderRadius: 999 },
+  analysisModalList: { maxHeight: 420 },
+  analysisControlRow: { marginTop: 8, marginHorizontal: 14, alignItems: 'flex-start' },
+  analysisMetricRow: { marginTop: 6, marginHorizontal: 12, flexGrow: 0 },
+  analysisMetricRowContent: { gap: 8, paddingRight: 12 },
+  analysisMetricChip: { paddingVertical: 8 },
+  analysisRangeText: { marginTop: 8, color: '#9AAEC0', fontSize: 12, textAlign: 'center' },
+  analysisNoDataText: { marginTop: 8, color: '#9AAEC0', fontSize: 13, textAlign: 'center' },
+  analysisChartWrap: {
+    marginHorizontal: 12,
+    marginTop: 8,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: '#24313E',
+    backgroundColor: '#121922',
+    paddingVertical: 10,
+  },
+  weekAxisRow: { flexDirection: 'row', width: WEEK_WIDTH * 14 },
+  weekAxisItem: { width: WEEK_WIDTH, alignItems: 'center', justifyContent: 'center', paddingVertical: 2 },
+  analysisOptionCard: {
+    borderWidth: 1,
+    borderColor: '#273644',
+    borderRadius: 12,
+    backgroundColor: '#1A222C',
+    paddingHorizontal: 12,
+    paddingVertical: 12,
+    marginBottom: 10,
+    gap: 4,
+  },
+  analysisOptionTitle: { color: '#E3EAF2', fontSize: 15, fontWeight: '700' },
+  analysisOptionText: { color: '#9AAEC0', fontSize: 13, lineHeight: 18 },
+  analysisPieCard: {
+    marginHorizontal: 12,
+    marginTop: 8,
+    backgroundColor: '#151D26',
+    borderRadius: 14,
+    paddingHorizontal: 12,
+    paddingVertical: 16,
+    borderWidth: 1,
+    borderColor: '#24313E',
+    alignItems: 'center',
+  },
+  analysisPieLegend: { marginTop: 10, width: '100%', gap: 8 },
+  analysisPieLegendRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 8 },
+  analysisPieLegendLabelWrap: { flexDirection: 'row', alignItems: 'center', gap: 8, flex: 1 },
+  analysisPieLegendValue: { color: '#DCE4EC', fontSize: 13, fontWeight: '700' },
   diaryChartCanvas: { height: 230, position: 'relative' },
   diaryPointOverlay: { ...StyleSheet.absoluteFillObject },
   diaryPointHitbox: { position: 'absolute', width: 24, height: 24, borderRadius: 12 },
@@ -5024,9 +7187,127 @@ const styles = StyleSheet.create({
     padding: 12,
     gap: 8,
   },
-  trainingHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
+  trainingHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', gap: 10 },
   trainingHeaderActions: { flexDirection: 'row', gap: 12 },
   trainingTitle: { color: '#FFFFFF', fontSize: 18, fontWeight: '700' },
+  trainingTitlePressable: { flex: 1, minWidth: 0 },
+  trainingHeaderMenuWrap: { position: 'relative' },
+  trainingMiniMenuButton: {
+    width: 34,
+    height: 34,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#3F5263',
+    backgroundColor: '#1A222C',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  sessionMenuDismissOverlay: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    zIndex: 50,
+  },
+  sessionExerciseMenu: {
+    position: 'absolute',
+    top: 40,
+    right: 0,
+    width: 210,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#2B3A48',
+    backgroundColor: '#101821',
+    paddingVertical: 6,
+    zIndex: 200,
+    elevation: 200,
+  },
+  sessionExerciseMenuItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 11,
+  },
+  sessionExerciseMenuText: { color: '#DCE4EC', fontSize: 14, fontWeight: '600' },
+  sessionExerciseMenuTextDanger: { color: '#EF9A9A' },
+  sessionMenuOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0, 0, 0, 0.55)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: 24,
+  },
+  sessionMenuCard: {
+    width: '100%',
+    maxWidth: 320,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: '#2B3A48',
+    backgroundColor: '#151D26',
+    paddingVertical: 12,
+    paddingHorizontal: 4,
+  },
+  sessionMenuTitle: {
+    color: '#FFFFFF',
+    fontSize: 16,
+    fontWeight: '700',
+    textAlign: 'center',
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+  },
+  sessionMenuDivider: {
+    height: 1,
+    backgroundColor: '#2B3A48',
+    marginVertical: 8,
+    marginHorizontal: 12,
+  },
+  sessionDropdownBackdrop: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    zIndex: 100,
+  },
+  sessionDropdownMenu: {
+    position: 'absolute',
+    top: 100,
+    right: 12,
+    width: 200,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#2B3A48',
+    backgroundColor: '#151D26',
+    paddingVertical: 6,
+    zIndex: 101,
+    elevation: 10,
+  },
+  sessionDropdownTitle: {
+    color: '#FFFFFF',
+    fontSize: 14,
+    fontWeight: '700',
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+  },
+  sessionDropdownDivider: {
+    height: 1,
+    backgroundColor: '#2B3A48',
+    marginVertical: 4,
+  },
+  sessionDropdownItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+  },
+  sessionDropdownItemText: {
+    color: '#DCE4EC',
+    fontSize: 14,
+    fontWeight: '600',
+  },
   trainingHomeButtonsRow: { flexDirection: 'row', gap: 8 },
   trainingHomeButton: { flex: 1 },
   trainingHomeButtonContent: { minHeight: 52 },
@@ -5207,35 +7488,63 @@ const styles = StyleSheet.create({
   trainingBackButton: { position: 'absolute', left: 12, top: 10, flexDirection: 'row', alignItems: 'center', gap: 4, zIndex: 5, elevation: 5 },
   sectionBackText: { color: '#DCE4EC', fontSize: 14, fontWeight: '600' },
   trainingTimer: { color: '#E3EAF2', fontSize: 24, fontWeight: '800', textAlign: 'center' },
-  trainingStatActions: { flexDirection: 'row', gap: 6, marginTop: 6 },
-  trainingStatButton: {
-    width: 26,
-    height: 26,
-    borderRadius: 8,
+  trainingStatActions: { flexDirection: 'row', alignItems: 'center', marginTop: 0 },
+  trainingStatInput: {
+    minWidth: 48,
+    height: 32,
+    borderRadius: 9,
     borderWidth: 1,
     borderColor: '#445361',
-    alignItems: 'center',
-    justifyContent: 'center',
     backgroundColor: '#101821',
+    color: '#FFFFFF',
+    fontSize: 15,
+    fontWeight: '700',
+    textAlign: 'center',
+    paddingHorizontal: 6,
+    paddingVertical: 0,
   },
-  trainingStatButtonText: { color: '#FFFFFF', fontSize: 16, fontWeight: '700', marginTop: -1 },
   trainingMeta: { color: '#A8BACB', fontSize: 13, marginTop: 2 },
   loggedSetList: { gap: 6, marginTop: 2 },
   loggedSetEmpty: { color: '#FFFFFF', fontSize: 13 },
+  sessionMoveBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 12,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: '#35526D',
+    backgroundColor: '#162433',
+    paddingHorizontal: 12,
+    paddingVertical: 12,
+  },
+  sessionMoveBannerTextWrap: { flex: 1, gap: 2 },
+  sessionMoveBannerTitle: { color: '#FFFFFF', fontSize: 15, fontWeight: '800' },
+  sessionMoveBannerSubtitle: { color: '#AFC4D8', fontSize: 12 },
+  sessionMoveDoneButton: {
+    minHeight: 38,
+    borderRadius: 10,
+    backgroundColor: '#A5D6A7',
+    paddingHorizontal: 14,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  sessionMoveDoneButtonText: { color: '#0F1419', fontSize: 14, fontWeight: '800' },
   loggedSetRow: {
     borderRadius: 8,
     borderWidth: 1,
     borderColor: '#2C3A49',
     backgroundColor: '#16202B',
     paddingHorizontal: 10,
-    paddingVertical: 7,
-    gap: 8,
+    paddingVertical: 5,
+    gap: 6,
   },
-  loggedSetRowMain: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', gap: 10 },
-  loggedSetTitle: { color: '#FFFFFF', fontWeight: '700', minWidth: 48 },
-  loggedSetMetrics: { alignItems: 'center', minWidth: 108 },
-  loggedSetMetricLabel: { color: '#FFFFFF', fontSize: 11, textTransform: 'uppercase' },
-  loggedSetMetricValue: { color: '#FFFFFF', fontSize: 13, fontWeight: '700' },
+  loggedSetRowTop: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 10 },
+  loggedSetRowMain: { flexDirection: 'row', justifyContent: 'flex-start', alignItems: 'center', gap: 10, flexWrap: 'wrap', flex: 1, minWidth: 0 },
+  loggedSetTitle: { color: '#FFFFFF', fontWeight: '700', fontSize: 12, minWidth: 42 },
+  loggedSetMetrics: { flexDirection: 'row', alignItems: 'center', gap: 6 },
+  loggedSetMetricLabel: { color: '#FFFFFF', fontSize: 10, textTransform: 'uppercase' },
+  loggedSetMetricValue: { color: '#FFFFFF', fontSize: 18, fontWeight: '700' },
   pbFeedbackBox: {
     borderRadius: 8,
     borderWidth: 1,
@@ -5245,9 +7554,47 @@ const styles = StyleSheet.create({
     paddingVertical: 8,
   },
   pbFeedbackTitle: { color: '#D7F7E2', fontWeight: '800', fontSize: 13 },
+  pbFeedbackBoxInline: {
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#3D8055',
+    backgroundColor: '#1B3A2A',
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    minWidth: 72,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
   trainingBottomRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
   trainingLastLogged: { color: '#8FA1B3', fontSize: 12 },
-  trainingButtons: { flexDirection: 'row', gap: 8, marginTop: 12 },
+  trainingButtons: { flexDirection: 'row', gap: 8, marginTop: 12, justifyContent: 'flex-end', alignSelf: 'flex-end' },
+  trainingCardCollapsed: { paddingVertical: 10, gap: 0 },
+  trainingCardMenuOpen: { zIndex: 100, elevation: 100 },
+  trainingCardDragging: {
+    zIndex: 30,
+    elevation: 30,
+    shadowColor: '#000000',
+    shadowOpacity: 0.28,
+    shadowRadius: 12,
+    shadowOffset: { width: 0, height: 8 },
+  },
+  sessionMoveHandle: {
+    width: 40,
+    height: 40,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#3F5263',
+    backgroundColor: '#1A222C',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  sessionMoveHandleActive: {
+    borderColor: '#7FC8FF',
+    backgroundColor: '#1B2A38',
+  },
+  sessionMoveHandleDisabled: {
+    opacity: 0.45,
+  },
   savedPlanHeaderRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 },
   savedPlanActionsRow: { flexDirection: 'row', gap: 8, marginTop: 4 },
   savedPlanActionButton: { flex: 1 },
