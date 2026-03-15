@@ -84,5 +84,23 @@
    <ArchiveAction
       buildConfiguration = "Release"
       revealArchiveInOrganizer = "YES">
+      <PreActions>
+         <ExecutionAction
+            ActionType = "Xcode.IDEStandardExecutionActionsCore.ExecutionActionType.ShellScriptAction">
+            <ActionContent
+               title = "Prepare JS and Pods for Archive"
+               scriptText = "set -euo pipefail&#10;#region agent log&#10;echo &quot;[AGENT-DEBUG c5427d H6] archive pre-action started&quot;&#10;#endregion&#10;REPO_ROOT=&quot;$SRCROOT/..&quot;&#10;if [ -f &quot;$REPO_ROOT/package-lock.json&quot; ]; then&#10;  #region agent log&#10;  echo &quot;[AGENT-DEBUG c5427d H6] running npm ci&quot;&#10;  #endregion&#10;  (cd &quot;$REPO_ROOT&quot; &amp;&amp; npm ci --no-audit)&#10;else&#10;  #region agent log&#10;  echo &quot;[AGENT-DEBUG c5427d H6] package-lock missing, running npm install&quot;&#10;  #endregion&#10;  (cd &quot;$REPO_ROOT&quot; &amp;&amp; npm install --no-audit)&#10;fi&#10;#region agent log&#10;echo &quot;[AGENT-DEBUG c5427d H6] npm step complete, running pod install&quot;&#10;#endregion&#10;(cd &quot;$SRCROOT&quot; &amp;&amp; pod install)&#10;#region agent log&#10;echo &quot;[AGENT-DEBUG c5427d H6] archive pre-action completed&quot;&#10;#endregion&#10;">
+               <EnvironmentBuildable>
+                  <BuildableReference
+                     BuildableIdentifier = "primary"
+                     BlueprintIdentifier = "13B07F861A680F5B00A75B9A"
+                     BuildableName = "TrackWell.app"
+                     BlueprintName = "TrackWell"
+                     ReferencedContainer = "container:TrackWell.xcodeproj">
+                  </BuildableReference>
+               </EnvironmentBuildable>
+            </ActionContent>
+         </ExecutionAction>
+      </PreActions>
    </ArchiveAction>
 </Scheme>
