@@ -3,8 +3,14 @@ set -euo pipefail
 
 echo "==> Xcode Cloud post-clone start"
 
-REPO_ROOT="${CI_PRIMARY_REPOSITORY_PATH:-$PWD}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
+
+if [ ! -f "package.json" ]; then
+  echo "ERROR: package.json not found at repository root: $REPO_ROOT"
+  exit 1
+fi
 
 echo "==> Repository root: $REPO_ROOT"
 echo "==> Node version: $(node -v)"

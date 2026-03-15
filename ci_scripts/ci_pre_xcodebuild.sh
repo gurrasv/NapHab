@@ -3,8 +3,14 @@ set -euo pipefail
 
 echo "==> Xcode Cloud pre-xcodebuild start"
 
-REPO_ROOT="${CI_PRIMARY_REPOSITORY_PATH:-$PWD}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
+
+if [ ! -f "package.json" ]; then
+  echo "ERROR: package.json not found at repository root: $REPO_ROOT"
+  exit 1
+fi
 
 if [ -f "package-lock.json" ]; then
   echo "==> Running npm ci to ensure complete dependencies"
