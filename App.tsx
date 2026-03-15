@@ -352,19 +352,32 @@ async function requestIosNotificationPermission(): Promise<boolean> {
 
 async function ensureIosNotificationCategoryConfigured(): Promise<void> {
   if (Platform.OS !== 'ios') return;
-  await Notifications.setNotificationCategoryAsync(
-    IOS_REMINDER_CATEGORY_ID,
-    [
-      {
-        identifier: IOS_ACTION_MARK_DONE,
-        buttonTitle: 'Klar',
+  const actions: Notifications.NotificationAction[] = [
+    {
+      identifier: IOS_ACTION_MARK_DONE,
+      buttonTitle: 'Klar',
+      options: {
+        // Keep foreground behavior explicit so app can process action reliably.
+        opensAppToForeground: true,
       },
-      {
-        identifier: IOS_ACTION_SNOOZE,
-        buttonTitle: `Snooza ${IOS_SNOOZE_MINUTES} min`,
+    },
+    {
+      identifier: IOS_ACTION_SNOOZE,
+      buttonTitle: `Snooza ${IOS_SNOOZE_MINUTES} min`,
+      options: {
+        opensAppToForeground: true,
       },
-    ],
-  );
+    },
+  ];
+
+  await Notifications.setNotificationCategoryAsync(IOS_REMINDER_CATEGORY_ID, actions);
+  // iOS can occasionally fail to persist a category during initial startup race;
+  // verify once and retry so scheduled notifications consistently get actions.
+  const categories = await Notifications.getNotificationCategoriesAsync();
+  const hasReminderCategory = categories.some((category) => category.identifier === IOS_REMINDER_CATEGORY_ID);
+  if (!hasReminderCategory) {
+    await Notifications.setNotificationCategoryAsync(IOS_REMINDER_CATEGORY_ID, actions);
+  }
 }
 
 async function appendIosPendingCompletion(completion: PendingCompletionItem): Promise<void> {
