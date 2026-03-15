@@ -1,0 +1,6 @@
+module Pods_TrackWell {
+  umbrella header "Pods-TrackWell-umbrella.h"
+
+  export *
+  module * { export * }
+}
