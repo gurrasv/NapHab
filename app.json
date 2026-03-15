@@ -17,7 +17,8 @@
       "supportsTablet": true,
       "bundleIdentifier": "com.gurrasv.naphabapp",
       "infoPlist": {
-        "ITSAppUsesNonExemptEncryption": false
+        "ITSAppUsesNonExemptEncryption": false,
+        "NSSupportsLiveActivities": true
       }
     },
     "android": {

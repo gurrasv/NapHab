@@ -20,6 +20,8 @@ type NaphabNativeNotificationsModuleType = {
   consumePendingCompletions(): Promise<PendingCompletion[]>;
   canScheduleExactAlarms(): Promise<boolean>;
   openExactAlarmSettings(): Promise<void>;
+  showWorkoutNotification(startedAtIso: string): Promise<boolean | void>;
+  dismissWorkoutNotification(): Promise<void>;
 };
 
 export default requireNativeModule<NaphabNativeNotificationsModuleType>(

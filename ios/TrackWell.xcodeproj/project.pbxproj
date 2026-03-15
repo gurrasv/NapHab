@@ -8,6 +8,9 @@
 
 /* Begin PBXBuildFile section */
 		13B07FBF1A68108700A75B9A /* Images.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 13B07FB51A68108700A75B9A /* Images.xcassets */; };
+		A1AA010101AA010100AA0001 /* TrackWellLiveActivity.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = A1AA000101AA000100AA0001 /* TrackWellLiveActivity.appex */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
+		A1AA010201AA010200AA0001 /* TrackWellLiveActivityBundle.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1AA000201AA000200AA0001 /* TrackWellLiveActivityBundle.swift */; };
+		A1AA010301AA010300AA0001 /* TrackWellWorkoutLiveActivity.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1AA000301AA000300AA0001 /* TrackWellWorkoutLiveActivity.swift */; };
 		3E461D99554A48A4959DE609 /* SplashScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = AA286B85B6C04FC6940260E9 /* SplashScreen.storyboard */; };
 		914032CCD756F0B10325E760 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = 10F3C4B59DC9C56F207444EF /* PrivacyInfo.xcprivacy */; };
 		BB2F792D24A3F905000567C9 /* Expo.plist in Resources */ = {isa = PBXBuildFile; fileRef = BB2F792C24A3F905000567C9 /* Expo.plist */; };
@@ -16,12 +19,40 @@
 		F11748422D0307B40044C1D9 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = F11748412D0307B40044C1D9 /* AppDelegate.swift */; };
 /* End PBXBuildFile section */
 
+/* Begin PBXContainerItemProxy section */
+		A1AA050101AA050100AA0001 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 83CBB9F71A601CBA00E9B192 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = A1AA030101AA030100AA0001;
+			remoteInfo = TrackWellLiveActivity;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		A1AA020401AA020400AA0001 /* Embed App Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				A1AA010101AA010100AA0001 /* TrackWellLiveActivity.appex in Embed App Extensions */,
+			);
+			name = "Embed App Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
 /* Begin PBXFileReference section */
 		0A3AB932783706FB4ECD257C /* ExpoModulesProvider.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = ExpoModulesProvider.swift; path = "Pods/Target Support Files/Pods-TrackWell/ExpoModulesProvider.swift"; sourceTree = "<group>"; };
 		10F3C4B59DC9C56F207444EF /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; includeInIndex = 1; name = PrivacyInfo.xcprivacy; path = TrackWell/PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
 		13B07F961A680F5B00A75B9A /* TrackWell.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = TrackWell.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		13B07FB51A68108700A75B9A /* Images.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; name = Images.xcassets; path = TrackWell/Images.xcassets; sourceTree = "<group>"; };
 		13B07FB61A68108700A75B9A /* Info.plist */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.plist.xml; name = Info.plist; path = TrackWell/Info.plist; sourceTree = "<group>"; };
+		A1AA000101AA000100AA0001 /* TrackWellLiveActivity.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = TrackWellLiveActivity.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		A1AA000201AA000200AA0001 /* TrackWellLiveActivityBundle.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TrackWellLiveActivityBundle.swift; sourceTree = "<group>"; };
+		A1AA000301AA000300AA0001 /* TrackWellWorkoutLiveActivity.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TrackWellWorkoutLiveActivity.swift; sourceTree = "<group>"; };
+		A1AA000401AA000400AA0001 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		5CD84D6E701A9A10AB1DFA3F /* Pods-TrackWell.release.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-TrackWell.release.xcconfig"; path = "Target Support Files/Pods-TrackWell/Pods-TrackWell.release.xcconfig"; sourceTree = "<group>"; };
 		7F7BECBB262A01ACEC549E3D /* libPods-TrackWell.a */ = {isa = PBXFileReference; explicitFileType = archive.ar; includeInIndex = 0; path = "libPods-TrackWell.a"; sourceTree = BUILT_PRODUCTS_DIR; };
 		9419C10350045C7B7E76BA6A /* Pods-TrackWell.debug.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-TrackWell.debug.xcconfig"; path = "Target Support Files/Pods-TrackWell/Pods-TrackWell.debug.xcconfig"; sourceTree = "<group>"; };
@@ -41,6 +72,13 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		A1AA020201AA020200AA0001 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -56,6 +94,16 @@
 				10F3C4B59DC9C56F207444EF /* PrivacyInfo.xcprivacy */,
 			);
 			name = TrackWell;
+			sourceTree = "<group>";
+		};
+		A1AA000501AA000500AA0001 /* TrackWellLiveActivity */ = {
+			isa = PBXGroup;
+			children = (
+				A1AA000201AA000200AA0001 /* TrackWellLiveActivityBundle.swift */,
+				A1AA000301AA000300AA0001 /* TrackWellWorkoutLiveActivity.swift */,
+				A1AA000401AA000400AA0001 /* Info.plist */,
+			);
+			path = TrackWellLiveActivity;
 			sourceTree = "<group>";
 		};
 		2D16E6871FA4F8E400B85C8A /* Frameworks */ = {
@@ -88,6 +136,7 @@
 			isa = PBXGroup;
 			children = (
 				13B07FAE1A68108700A75B9A /* TrackWell */,
+				A1AA000501AA000500AA0001 /* TrackWellLiveActivity */,
 				832341AE1AAA6A7D00B99B32 /* Libraries */,
 				83CBBA001A601CBA00E9B192 /* Products */,
 				2D16E6871FA4F8E400B85C8A /* Frameworks */,
@@ -103,6 +152,7 @@
 			isa = PBXGroup;
 			children = (
 				13B07F961A680F5B00A75B9A /* TrackWell.app */,
+				A1AA000101AA000100AA0001 /* TrackWellLiveActivity.appex */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -143,6 +193,7 @@
 				BE4B4C8D95A553FAA0E45D83 /* [Expo] Configure project */,
 				13B07F871A680F5B00A75B9A /* Sources */,
 				13B07F8C1A680F5B00A75B9A /* Frameworks */,
+				A1AA020401AA020400AA0001 /* Embed App Extensions */,
 				13B07F8E1A680F5B00A75B9A /* Resources */,
 				00DD1BFF1BD5951E006B06BC /* Bundle React Native code and images */,
 				800E24972A6A228C8D4807E9 /* [CP] Copy Pods Resources */,
@@ -151,11 +202,29 @@
 			buildRules = (
 			);
 			dependencies = (
+				A1AA060101AA060100AA0001 /* PBXTargetDependency */,
 			);
 			name = TrackWell;
 			productName = TrackWell;
 			productReference = 13B07F961A680F5B00A75B9A /* TrackWell.app */;
 			productType = "com.apple.product-type.application";
+		};
+		A1AA030101AA030100AA0001 /* TrackWellLiveActivity */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A1AA040101AA040100AA0001 /* Build configuration list for PBXNativeTarget "TrackWellLiveActivity" */;
+			buildPhases = (
+				A1AA020101AA020100AA0001 /* Sources */,
+				A1AA020201AA020200AA0001 /* Frameworks */,
+				A1AA020301AA020300AA0001 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = TrackWellLiveActivity;
+			productName = TrackWellLiveActivity;
+			productReference = A1AA000101AA000100AA0001 /* TrackWellLiveActivity.appex */;
+			productType = "com.apple.product-type.app-extension";
 		};
 /* End PBXNativeTarget section */
 
@@ -166,6 +235,9 @@
 				LastUpgradeCheck = 1130;
 				TargetAttributes = {
 					13B07F861A680F5B00A75B9A = {
+						LastSwiftMigration = 1250;
+					};
+					A1AA030101AA030100AA0001 = {
 						LastSwiftMigration = 1250;
 					};
 				};
@@ -184,6 +256,7 @@
 			projectRoot = "";
 			targets = (
 				13B07F861A680F5B00A75B9A /* TrackWell */,
+				A1AA030101AA030100AA0001 /* TrackWellLiveActivity */,
 			);
 		};
 /* End PBXProject section */
@@ -197,6 +270,13 @@
 				13B07FBF1A68108700A75B9A /* Images.xcassets in Resources */,
 				3E461D99554A48A4959DE609 /* SplashScreen.storyboard in Resources */,
 				914032CCD756F0B10325E760 /* PrivacyInfo.xcprivacy in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A1AA020301AA020300AA0001 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -342,7 +422,24 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		A1AA020101AA020100AA0001 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A1AA010201AA010200AA0001 /* TrackWellLiveActivityBundle.swift in Sources */,
+				A1AA010301AA010300AA0001 /* TrackWellWorkoutLiveActivity.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		A1AA060101AA060100AA0001 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = A1AA030101AA030100AA0001 /* TrackWellLiveActivity */;
+			targetProxy = A1AA050101AA050100AA0001 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
 		13B07F941A680F5B00A75B9A /* Debug */ = {
@@ -408,6 +505,50 @@
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
 				VERSIONING_SYSTEM = "apple-generic";
+			};
+			name = Release;
+		};
+		A1AA040201AA040200AA0001 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = TrackWellLiveActivity/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.1;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.gurrasv.naphabapp.liveactivity;
+				PRODUCT_NAME = TrackWellLiveActivity;
+				SKIP_INSTALL = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Debug;
+		};
+		A1AA040301AA040300AA0001 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = TrackWellLiveActivity/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.1;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.gurrasv.naphabapp.liveactivity;
+				PRODUCT_NAME = TrackWellLiveActivity;
+				SKIP_INSTALL = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 1;
 			};
 			name = Release;
 		};
@@ -535,6 +676,15 @@
 			buildConfigurations = (
 				13B07F941A680F5B00A75B9A /* Debug */,
 				13B07F951A680F5B00A75B9A /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		A1AA040101AA040100AA0001 /* Build configuration list for PBXNativeTarget "TrackWellLiveActivity" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A1AA040201AA040200AA0001 /* Debug */,
+				A1AA040301AA040300AA0001 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

@@ -1,10 +1,19 @@
 {
   "platforms": [
-    "android"
+    "android",
+    "ios"
   ],
   "android": {
     "modules": [
       "com.gurrasv.naphabapp.modules.notifications.NaphabNativeNotificationsModule"
+    ]
+  },
+  "ios": {
+    "modules": [
+      "NaphabNativeNotificationsModule"
+    ],
+    "appDelegateSubscribers": [
+      "NaphabNotificationsAppDelegateSubscriber"
     ]
   }
 }

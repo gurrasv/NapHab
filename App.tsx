@@ -13,11 +13,14 @@ import * as Device from 'expo-device';
 import * as Notifications from 'expo-notifications';
 import {
   consumeAndroidPendingCompletions,
+  consumeIosPendingCompletionsNative,
   dismissAndroidWorkoutNotification,
+  dismissIosWorkoutLiveActivity,
   ensureAndroidExactAlarmPermission,
   requestAndroidNotificationPermission,
   scheduleAndroidNotifications,
   showAndroidWorkoutNotification,
+  showIosWorkoutLiveActivity,
   type AndroidNotificationSchedule,
 } from './notifications/androidNativeNotifications';
 import { buildUpcomingScheduleOccurrences } from './notifications/schedulerEngine';
@@ -100,6 +103,7 @@ type PersistedState = {
   exercises: Exercise[];
   logs: ExerciseLog[];
   painSeries: PainSeries[];
+  archivedPainSeries?: PainSeries[];
   workoutPlans?: WorkoutPlan[];
   completedWorkouts?: CompletedWorkout[];
   exerciseWeightPbs?: ExerciseWeightPb[];
@@ -382,15 +386,16 @@ async function ensureIosNotificationCategoryConfigured(): Promise<void> {
       identifier: IOS_ACTION_MARK_DONE,
       buttonTitle: 'Klar',
       options: {
-        // Keep foreground behavior explicit so app can process action reliably.
-        opensAppToForeground: true,
+          opensAppToForeground: false,
+          isAuthenticationRequired: false,
       },
     },
     {
       identifier: IOS_ACTION_SNOOZE,
       buttonTitle: `Snooza ${IOS_SNOOZE_MINUTES} min`,
       options: {
-        opensAppToForeground: true,
+          opensAppToForeground: false,
+          isAuthenticationRequired: false,
       },
     },
   ];
@@ -424,6 +429,16 @@ async function appendIosPendingCompletion(completion: PendingCompletionItem): Pr
 
 async function consumeIosPendingCompletions(): Promise<PendingCompletionItem[]> {
   if (Platform.OS !== 'ios') return [];
+  try {
+    const native = await consumeIosPendingCompletionsNative();
+    if (Array.isArray(native) && native.length > 0) {
+      return native
+        .filter((row) => row?.exerciseId && row?.atIso)
+        .map((row) => ({ exerciseId: row.exerciseId, atIso: row.atIso }));
+    }
+  } catch {
+    // Fall back to AsyncStorage backlog for compatibility if native module is unavailable.
+  }
   try {
     const raw = await AsyncStorage.getItem(IOS_PENDING_COMPLETIONS_STORAGE_KEY);
     await AsyncStorage.removeItem(IOS_PENDING_COMPLETIONS_STORAGE_KEY);
@@ -1245,11 +1260,20 @@ function TrainingScreen({
   }, [sessionStartedAtIso, sessionExercises, sessionSourcePlanId, sessionSourcePlanName]);
 
   useEffect(() => {
-    if (Platform.OS !== 'android') return;
-    if (sessionStartedAtIso) {
-      showAndroidWorkoutNotification(sessionStartedAtIso).catch(() => {});
-    } else {
-      dismissAndroidWorkoutNotification().catch(() => {});
+    if (Platform.OS === 'android') {
+      if (sessionStartedAtIso) {
+        showAndroidWorkoutNotification(sessionStartedAtIso).catch(() => {});
+      } else {
+        dismissAndroidWorkoutNotification().catch(() => {});
+      }
+      return;
+    }
+    if (Platform.OS === 'ios') {
+      if (sessionStartedAtIso) {
+        showIosWorkoutLiveActivity(sessionStartedAtIso).catch(() => {});
+      } else {
+        dismissIosWorkoutLiveActivity().catch(() => {});
+      }
     }
   }, [sessionStartedAtIso]);
 
@@ -4980,9 +5004,11 @@ function SmoothSlider({
 function DiaryScreen({
   series,
   setSeries,
+  onArchiveSeries,
 }: {
   series: PainSeries[];
   setSeries: React.Dispatch<React.SetStateAction<PainSeries[]>>;
+  onArchiveSeries: (series: PainSeries) => void;
 }) {
   const insets = useSafeAreaInsets();
   const [activeSeriesId, setActiveSeriesId] = useState<string | null>(series[0]?.id ?? null);
@@ -5105,7 +5131,12 @@ function DiaryScreen({
             <Pressable onPress={() => setActiveSeriesId(item.id)}>
               <View style={styles.seriesHeader}>
                 <Text style={styles.seriesTitle}>{item.name}</Text>
-                <Pressable onPress={() => setSeries((prev) => prev.filter((s) => s.id !== item.id))}>
+                <Pressable
+                  onPress={() => {
+                    onArchiveSeries(item);
+                    setSeries((prev) => prev.filter((s) => s.id !== item.id));
+                  }}
+                >
                   <MaterialIcons name="delete" size={24} color="#EF9A9A" />
                 </Pressable>
               </View>
@@ -5556,6 +5587,9 @@ export default function App() {
   const [rehabLibraryExercises, setRehabLibraryExercises] = useState<LibraryExercise[]>(LIBRARY_EXERCISES);
   const [gymLibraryExercises, setGymLibraryExercises] = useState<LibraryExercise[]>(GYM_LIBRARY_EXERCISES);
   const [analysisBlocks, setAnalysisBlocks] = useState<AnalysisBlock[]>([{ id: '1', type: 'rehabFrequency' }]);
+  const [archivedPainSeries, setArchivedPainSeries] = useState<PainSeries[]>([]);
+  const [archivedPainSeriesSelectionMode, setArchivedPainSeriesSelectionMode] = useState(false);
+  const [selectedArchivedPainSeriesIds, setSelectedArchivedPainSeriesIds] = useState<string[]>([]);
   const [newSeriesDialog, setNewSeriesDialog] = useState(false);
   const [newSeriesName, setNewSeriesName] = useState('');
   const [libraryVisible, setLibraryVisible] = useState(false);
@@ -5610,6 +5644,15 @@ export default function App() {
               }),
             );
           }
+          if (Array.isArray(parsed.archivedPainSeries)) {
+            setArchivedPainSeries(
+              parsed.archivedPainSeries.map((item) => ({
+                ...item,
+                entries: Array.isArray(item.entries) ? item.entries : [],
+                draftNote: typeof item.draftNote === 'string' ? item.draftNote : '',
+              })),
+            );
+          }
           if (Array.isArray(parsed.workoutPlans)) setWorkoutPlans(parsed.workoutPlans);
           if (Array.isArray(parsed.completedWorkouts)) setCompletedWorkouts(parsed.completedWorkouts);
           if (Array.isArray(parsed.exerciseWeightPbs)) setExerciseWeightPbs(parsed.exerciseWeightPbs);
@@ -5642,6 +5685,7 @@ export default function App() {
       exercises,
       logs,
       painSeries,
+      archivedPainSeries,
       workoutPlans,
       completedWorkouts,
       exerciseWeightPbs,
@@ -5652,7 +5696,7 @@ export default function App() {
     AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(payload)).catch(() => {
       // Ignore temporary storage failures.
     });
-  }, [exercises, logs, painSeries, workoutPlans, completedWorkouts, exerciseWeightPbs, rehabLibraryExercises, gymLibraryExercises, analysisBlocks, isHydrated]);
+  }, [exercises, logs, painSeries, archivedPainSeries, workoutPlans, completedWorkouts, exerciseWeightPbs, rehabLibraryExercises, gymLibraryExercises, analysisBlocks, isHydrated]);
 
   /* ── Deep link import handler ── */
   const pendingDeepLinkRef = useRef<string | null>(null);
@@ -6158,6 +6202,66 @@ export default function App() {
     setWizardTimesPerDay(`${Math.max(1, exercise.times.length || 1)}`);
     setWizardTimes(exercise.times.length > 0 ? exercise.times : ['09:00']);
   };
+  const normalizePainSeriesName = useCallback((value: string) => value.trim().replace(/\s+/g, ' ').toLocaleLowerCase('sv-SE'), []);
+  const archivePainSeries = useCallback((removedSeries: PainSeries) => {
+    const normalizedName = normalizePainSeriesName(removedSeries.name);
+    if (!normalizedName) return;
+    setArchivedPainSeries((prev) => {
+      const withoutSameName = prev.filter((item) => normalizePainSeriesName(item.name) !== normalizedName);
+      return [{ ...removedSeries, draftNote: '' }, ...withoutSameName];
+    });
+  }, [normalizePainSeriesName]);
+  const addPainSeries = useCallback((rawName: string, archivedItem?: PainSeries) => {
+    const name = rawName.trim().replace(/\s+/g, ' ');
+    if (!name) return;
+    const normalizedName = normalizePainSeriesName(name);
+    const exists = painSeries.some((item) => normalizePainSeriesName(item.name) === normalizedName);
+    if (exists) {
+      Alert.alert('Område finns redan', `"${name}" finns redan i dagboken.`);
+      return;
+    }
+    if (archivedItem) {
+      setPainSeries((prev) => [...prev, { ...archivedItem, id: `${Date.now()}-${Math.random()}`, name }]);
+      setArchivedPainSeries((prev) => prev.filter((item) => normalizePainSeriesName(item.name) !== normalizedName));
+      setSelectedArchivedPainSeriesIds((prev) => {
+        const next = prev.filter((id) => id !== archivedItem.id);
+        if (next.length === 0) setArchivedPainSeriesSelectionMode(false);
+        return next;
+      });
+    } else {
+      setPainSeries((prev) => [...prev, { id: `${Date.now()}-${Math.random()}`, name, value: 5, draftNote: '', entries: [] }]);
+    }
+    setNewSeriesName('');
+    setNewSeriesDialog(false);
+  }, [painSeries, normalizePainSeriesName]);
+  const addNewPainSeriesFromInput = useCallback(() => {
+    const normalizedName = normalizePainSeriesName(newSeriesName);
+    if (!normalizedName) return;
+    const archivedMatch = archivedPainSeries.find((item) => normalizePainSeriesName(item.name) === normalizedName);
+    addPainSeries(newSeriesName, archivedMatch);
+  }, [addPainSeries, archivedPainSeries, newSeriesName, normalizePainSeriesName]);
+  const activateArchivedPainSeriesSelection = useCallback((seriesId: string) => {
+    setArchivedPainSeriesSelectionMode(true);
+    setSelectedArchivedPainSeriesIds((prev) => (prev.includes(seriesId) ? prev : [...prev, seriesId]));
+  }, []);
+  const toggleArchivedPainSeriesSelection = useCallback((seriesId: string) => {
+    setSelectedArchivedPainSeriesIds((prev) => {
+      const next = prev.includes(seriesId) ? prev.filter((id) => id !== seriesId) : [...prev, seriesId];
+      if (next.length === 0) setArchivedPainSeriesSelectionMode(false);
+      return next;
+    });
+  }, []);
+  const deleteSelectedArchivedPainSeries = useCallback(() => {
+    if (selectedArchivedPainSeriesIds.length === 0) return;
+    setArchivedPainSeries((prev) => prev.filter((item) => !selectedArchivedPainSeriesIds.includes(item.id)));
+    setSelectedArchivedPainSeriesIds([]);
+    setArchivedPainSeriesSelectionMode(false);
+  }, [selectedArchivedPainSeriesIds]);
+  const closeNewSeriesModal = useCallback(() => {
+    setNewSeriesDialog(false);
+    setSelectedArchivedPainSeriesIds([]);
+    setArchivedPainSeriesSelectionMode(false);
+  }, []);
   const globalPlusColor =
     activeTab === 'Hem'
       ? '#A5D6A7'
@@ -6180,6 +6284,9 @@ export default function App() {
       return;
     }
     if (activeTab === 'Dagbok') {
+      setNewSeriesName('');
+      setSelectedArchivedPainSeriesIds([]);
+      setArchivedPainSeriesSelectionMode(false);
       setNewSeriesDialog(true);
     }
   }, [activeTab, openLibrarySheet]);
@@ -6293,7 +6400,7 @@ export default function App() {
               <Tab.Screen name="Dagbok" options={{ title: 'Dagbok' }}>
                 {() => (
                   <AnimatedTabScreen>
-                    <DiaryScreen series={painSeries} setSeries={setPainSeries} />
+                    <DiaryScreen series={painSeries} setSeries={setPainSeries} onArchiveSeries={archivePainSeries} />
                   </AnimatedTabScreen>
                 )}
               </Tab.Screen>
@@ -6794,34 +6901,70 @@ export default function App() {
             </Dialog.Actions>
           </Dialog>
 
-          <Dialog visible={newSeriesDialog} onDismiss={() => setNewSeriesDialog(false)}>
-            <Dialog.Title>Var har du ont?</Dialog.Title>
-            <Dialog.Content>
-              <TextInput
-                value={newSeriesName}
-                onChangeText={setNewSeriesName}
-                style={styles.input}
-                placeholder="Ex. Höger axel"
-                placeholderTextColor={PLACEHOLDER_COLOR}
-              />
-            </Dialog.Content>
-            <Dialog.Actions>
-              <Button onPress={() => setNewSeriesDialog(false)}>Avbryt</Button>
-              <Button
-                mode="contained"
-                onPress={() => {
-                  if (!newSeriesName.trim()) return;
-                  setPainSeries((prev) => [...prev, { id: `${Date.now()}`, name: newSeriesName.trim(), value: 5, draftNote: '', entries: [] }]);
-                  setNewSeriesName('');
-                  setNewSeriesDialog(false);
-                }}
-              >
-                Lägg till
-              </Button>
-            </Dialog.Actions>
-          </Dialog>
-
         </Portal>
+        <Modal visible={newSeriesDialog} transparent animationType="fade" onRequestClose={closeNewSeriesModal}>
+          <View style={styles.timePickerBackdrop}>
+            <View style={[styles.timePickerCard, styles.analysisModalCard]}>
+              <View style={styles.analysisModalHeader}>
+                <Text style={styles.timePickerTitle}>Lägg till smärtområde</Text>
+                <Pressable style={styles.analysisModalCloseButton} onPress={closeNewSeriesModal}>
+                  <MaterialIcons name="close" size={20} color="#9AAEC0" />
+                </Pressable>
+              </View>
+              <RNScrollView style={styles.analysisModalList} showsVerticalScrollIndicator={false}>
+                <TextInput
+                  value={newSeriesName}
+                  onChangeText={setNewSeriesName}
+                  style={styles.input}
+                  placeholder="Ex. Höger axel"
+                  placeholderTextColor={PLACEHOLDER_COLOR}
+                />
+                <View style={styles.diaryAreaModalActionRow}>
+                  <Button mode="contained" onPress={addNewPainSeriesFromInput} disabled={!newSeriesName.trim()}>
+                    Lägg till
+                  </Button>
+                </View>
+                <Text style={styles.analysisOptionText}>Tidigare borttagna områden</Text>
+                {archivedPainSeriesSelectionMode ? (
+                  <View style={styles.archivedSeriesSelectionRow}>
+                    <View style={styles.historySelectionActions}>
+                      <Text style={styles.historySelectedCount}>{selectedArchivedPainSeriesIds.length}</Text>
+                      <Pressable style={styles.historyTrashButton} onPress={deleteSelectedArchivedPainSeries}>
+                        <MaterialIcons name="delete" size={22} color="#0F1419" />
+                      </Pressable>
+                    </View>
+                  </View>
+                ) : null}
+                {archivedPainSeries.length === 0 ? <Text style={styles.analysisOptionText}>Inga sparade områden än så länge.</Text> : null}
+                {archivedPainSeries.map((item) => (
+                  <Pressable
+                    key={`archived-${item.id}`}
+                    style={[
+                      styles.analysisOptionCard,
+                      selectedArchivedPainSeriesIds.includes(item.id) && styles.historySelectedCard,
+                    ]}
+                    onLongPress={() => activateArchivedPainSeriesSelection(item.id)}
+                    onPress={() => {
+                      if (archivedPainSeriesSelectionMode) {
+                        toggleArchivedPainSeriesSelection(item.id);
+                        return;
+                      }
+                      addPainSeries(item.name, item);
+                    }}
+                  >
+                    <Text style={styles.analysisOptionTitle}>{item.name}</Text>
+                    <Text style={styles.analysisOptionText}>
+                      {item.entries.length > 0 ? `${item.entries.length} sparade registreringar` : 'Inga registreringar'}
+                    </Text>
+                  </Pressable>
+                ))}
+              </RNScrollView>
+              <View style={styles.timePickerActions}>
+                <Button onPress={closeNewSeriesModal}>Stäng</Button>
+              </View>
+            </View>
+          </View>
+        </Modal>
       </PaperProvider>
     </GestureHandlerRootView>
   );
@@ -7226,6 +7369,8 @@ const styles = StyleSheet.create({
   },
   analysisOptionTitle: { color: '#E3EAF2', fontSize: 15, fontWeight: '700' },
   analysisOptionText: { color: '#9AAEC0', fontSize: 13, lineHeight: 18 },
+  diaryAreaModalActionRow: { marginTop: 10, marginBottom: 12, alignItems: 'flex-end' },
+  archivedSeriesSelectionRow: { marginTop: 8, marginBottom: 10, alignItems: 'flex-end' },
   analysisPieCard: {
     marginHorizontal: 12,
     marginTop: 8,

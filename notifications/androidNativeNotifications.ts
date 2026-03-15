@@ -10,7 +10,7 @@ type NativeNotificationsModuleType = {
   consumePendingCompletions(): Promise<PendingCompletion[]>;
   canScheduleExactAlarms(): Promise<boolean>;
   openExactAlarmSettings(): Promise<void>;
-  showWorkoutNotification(startedAtIso: string): Promise<void>;
+  showWorkoutNotification(startedAtIso: string): Promise<boolean | void>;
   dismissWorkoutNotification(): Promise<void>;
 };
 
@@ -24,7 +24,7 @@ function getNativeNotificationsModule(): NativeNotificationsModuleType {
       );
     } catch (error) {
       const details = error instanceof Error ? error.message : String(error);
-      throw new Error(`Native Android notification module is not available: ${details}`);
+      throw new Error(`Native notification module is not available: ${details}`);
     }
   }
   return nativeModuleCache;
@@ -68,10 +68,29 @@ export async function consumeAndroidPendingCompletions(): Promise<PendingComplet
   return Array.isArray(items) ? items : [];
 }
 
+export async function consumeIosPendingCompletionsNative(): Promise<PendingCompletion[]> {
+  if (Platform.OS !== 'ios') return [];
+  const items = await getNativeNotificationsModule().consumePendingCompletions();
+  return Array.isArray(items) ? items : [];
+}
+
 export async function showAndroidWorkoutNotification(startedAtIso: string): Promise<void> {
   await getNativeNotificationsModule().showWorkoutNotification(startedAtIso);
 }
 
 export async function dismissAndroidWorkoutNotification(): Promise<void> {
+  await getNativeNotificationsModule().dismissWorkoutNotification();
+}
+
+export async function showIosWorkoutLiveActivity(startedAtIso: string): Promise<void> {
+  if (Platform.OS !== 'ios') return;
+  const started = await getNativeNotificationsModule().showWorkoutNotification(startedAtIso);
+  if (started === false) {
+    console.warn('[notifications] iOS Live Activity could not be started on this device/build.');
+  }
+}
+
+export async function dismissIosWorkoutLiveActivity(): Promise<void> {
+  if (Platform.OS !== 'ios') return;
   await getNativeNotificationsModule().dismissWorkoutNotification();
 }
