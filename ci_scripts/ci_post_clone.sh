@@ -19,6 +19,11 @@ else
   npm install --no-audit
 fi
 
+if [ ! -f "node_modules/expo-application/ios/PrivacyInfo.xcprivacy" ]; then
+  echo "ERROR: expo-application iOS privacy manifest not found after install."
+  exit 1
+fi
+
 echo "==> Installing iOS pods"
 cd ios
 pod install
