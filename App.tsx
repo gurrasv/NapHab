@@ -325,6 +325,25 @@ function parseDaysLabelToJsDays(daysLabel: string): number[] {
     .map((key) => WEEKDAY_KEY_TO_JS_DAY[key]);
 }
 
+function parseReminderTime(rawTime: string): { hours: number; minutes: number; canonicalTime: string } | null {
+  const normalized = rawTime.trim().replace('.', ':');
+  const [hoursRaw, minutesRaw] = normalized.split(':');
+  const hours = Number(hoursRaw);
+  const minutes = Number(minutesRaw);
+  if (!Number.isInteger(hours) || !Number.isInteger(minutes)) return null;
+  if (hours < 0 || hours > 23 || minutes < 0 || minutes > 59) return null;
+  return {
+    hours,
+    minutes,
+    canonicalTime: `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}`,
+  };
+}
+
+function mapJsDayToIosWeekday(jsDay: number): number {
+  // JS: Sun=0..Sat=6, iOS weekly trigger: Sun=1..Sat=7.
+  return jsDay === 0 ? 1 : jsDay + 1;
+}
+
 function getTodayWeekdayKey(): WeekdayKey {
   return WEEKDAY_KEY_BY_JS_DAY[new Date().getDay()] ?? 'mon';
 }
@@ -492,13 +511,12 @@ async function scheduleExerciseNotifications(
   exercises: Exercise[],
 ): Promise<void> {
   if (!Device.isDevice) return;
-
-  const now = new Date();
-  const candidates = buildUpcomingScheduleOccurrences(exercises, {
-    now,
-    windowDays: 30,
-  });
   if (Platform.OS === 'android') {
+    const now = new Date();
+    const candidates = buildUpcomingScheduleOccurrences(exercises, {
+      now,
+      windowDays: 30,
+    });
     const notificationPermissionGranted = await requestAndroidNotificationPermission();
     if (!notificationPermissionGranted) return;
     // Even without exact alarm permission we still schedule with inexact fallback in native layer.
@@ -523,26 +541,65 @@ async function scheduleExerciseNotifications(
   await ensureIosNotificationCategoryConfigured();
 
   await Notifications.cancelAllScheduledNotificationsAsync();
-  for (const candidate of candidates) {
-    await Notifications.scheduleNotificationAsync({
-      content: {
-        title: candidate.title,
-        body: `${candidate.sets} x ${candidate.reps}`,
-        sound: true,
-        categoryIdentifier: IOS_REMINDER_CATEGORY_ID,
-        data: {
-          exerciseId: candidate.exerciseId,
-          scheduleId: candidate.scheduleId,
-          scheduledAtIso: candidate.scheduledTime.toISOString(),
-          sets: candidate.sets,
-          reps: candidate.reps,
-        },
-      },
-      trigger: {
-        type: Notifications.SchedulableTriggerInputTypes.DATE,
-        date: candidate.scheduledTime,
-      },
-    });
+  for (const exercise of exercises) {
+    if (!exercise.remindersOn || exercise.times.length === 0) continue;
+    const jsDays = parseDaysLabelToJsDays(exercise.daysLabel);
+    if (jsDays.length === 0) continue;
+
+    for (const rawTime of exercise.times) {
+      const parsedTime = parseReminderTime(rawTime);
+      if (!parsedTime) continue;
+      const body = `${exercise.sets} x ${exercise.reps}`;
+      const baseData = {
+        exerciseId: exercise.id,
+        sets: exercise.sets,
+        reps: exercise.reps,
+      };
+
+      if (jsDays.length === 7) {
+        await Notifications.scheduleNotificationAsync({
+          content: {
+            title: exercise.title,
+            body,
+            sound: true,
+            categoryIdentifier: IOS_REMINDER_CATEGORY_ID,
+            data: {
+              ...baseData,
+              scheduleId: `${exercise.id}-${parsedTime.canonicalTime}-daily`,
+              scheduledAtIso: new Date().toISOString(),
+            },
+          },
+          trigger: {
+            type: Notifications.SchedulableTriggerInputTypes.DAILY,
+            hour: parsedTime.hours,
+            minute: parsedTime.minutes,
+          },
+        });
+        continue;
+      }
+
+      for (const jsDay of jsDays) {
+        await Notifications.scheduleNotificationAsync({
+          content: {
+            title: exercise.title,
+            body,
+            sound: true,
+            categoryIdentifier: IOS_REMINDER_CATEGORY_ID,
+            data: {
+              ...baseData,
+              scheduleId: `${exercise.id}-${parsedTime.canonicalTime}-${jsDay}-weekly`,
+              scheduledAtIso: new Date().toISOString(),
+            },
+          },
+          trigger: {
+            type: Notifications.SchedulableTriggerInputTypes.WEEKLY,
+            weekday: mapJsDayToIosWeekday(jsDay),
+            hour: parsedTime.hours,
+            minute: parsedTime.minutes,
+          },
+        });
+      }
+    }
   }
 }
 
