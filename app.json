@@ -1,6 +1,6 @@
 {
   "expo": {
-    "name": "TrackWell",
+    "name": "PTRLogger",
     "slug": "trackwell",
     "scheme": "trackwell",
     "version": "1.0.0",
@@ -10,28 +10,39 @@
     "newArchEnabled": false,
     "splash": {
       "image": "./assets/splash-icon.png",
+      "imageWidth": 230,
       "resizeMode": "contain",
-      "backgroundColor": "#ffffff"
+      "backgroundColor": "#0F1419"
     },
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.gurrasv.naphabapp",
       "infoPlist": {
         "ITSAppUsesNonExemptEncryption": false,
-        "NSSupportsLiveActivities": true
+        "NSSupportsLiveActivities": true,
+        "NSLocationWhenInUseUsageDescription": "Plats behovs for att spåra ditt utepass med karta, tid och fart.",
+        "NSLocationAlwaysAndWhenInUseUsageDescription": "Bakgrundsplats behovs for att fortsatta spårning nar skarmen ar last.",
+        "UIBackgroundModes": [
+          "location"
+        ]
       }
     },
     "android": {
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
-        "backgroundColor": "#ffffff"
+        "backgroundColor": "#0F1419"
       },
       "edgeToEdgeEnabled": true,
       "predictiveBackGestureEnabled": false,
       "package": "com.gurrasv.naphabapp",
       "permissions": [
         "android.permission.SCHEDULE_EXACT_ALARM",
-        "android.permission.POST_NOTIFICATIONS"
+        "android.permission.POST_NOTIFICATIONS",
+        "android.permission.ACCESS_COARSE_LOCATION",
+        "android.permission.ACCESS_FINE_LOCATION",
+        "android.permission.ACCESS_BACKGROUND_LOCATION",
+        "android.permission.FOREGROUND_SERVICE",
+        "android.permission.FOREGROUND_SERVICE_LOCATION"
       ]
     },
     "web": {
@@ -39,9 +50,28 @@
     },
     "plugins": [
       "./plugins/withNativeAndroidNotifications",
+      [
+        "expo-splash-screen",
+        {
+          "image": "./assets/splash-icon.png",
+          "imageWidth": 230,
+          "resizeMode": "contain",
+          "backgroundColor": "#0F1419"
+        }
+      ],
       "expo-notifications",
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "Plats behovs for att spåra ditt utepass.",
+          "locationAlwaysAndWhenInUsePermission": "Bakgrundsplats behovs for att fortsatta spårning nar skarmen ar last.",
+          "isIosBackgroundLocationEnabled": true,
+          "isAndroidBackgroundLocationEnabled": true
+        }
+      ],
       "expo-font",
-      "@react-native-community/datetimepicker"
+      "@react-native-community/datetimepicker",
+      "@maplibre/maplibre-react-native"
     ],
     "extra": {
       "appVariant": "preview",

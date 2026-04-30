@@ -47,7 +47,7 @@ export async function ensureAndroidExactAlarmPermission(): Promise<boolean> {
   await getNativeNotificationsModule().openExactAlarmSettings();
   Alert.alert(
     'Behorighet for alarm',
-    'Aktivera "Alarm och paminnelser" for TrackWell sa att schemalagda notiser fungerar nar appen ar stangd.',
+    'Aktivera "Alarm och paminnelser" for PTRLogger sa att schemalagda notiser fungerar nar appen ar stangd.',
     [{ text: 'OK' }],
   );
   return false;

@@ -2,11 +2,11 @@ package com.gurrasv.naphabapp.modules.notifications
 
 object NotificationConstants {
   const val CHANNEL_ID = "naphab_reminders"
-  const val CHANNEL_NAME = "TrackWell – Paminnelser"
-  const val CHANNEL_DESCRIPTION = "Paminnelser for ovningar i TrackWell"
+  const val CHANNEL_NAME = "PTRLogger – Paminnelser"
+  const val CHANNEL_DESCRIPTION = "Paminnelser for ovningar i PTRLogger"
 
   const val WORKOUT_CHANNEL_ID = "naphab_workout"
-  const val WORKOUT_CHANNEL_NAME = "TrackWell – Pagaende pass"
+  const val WORKOUT_CHANNEL_NAME = "PTRLogger – Pagaende pass"
   const val WORKOUT_CHANNEL_DESCRIPTION = "Visar ett pagaende traning pass"
   const val WORKOUT_NOTIFICATION_ID = 9001
 

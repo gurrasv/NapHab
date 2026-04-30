@@ -6,27 +6,71 @@ if (-not (Test-Path $Adb)) {
     exit 1
 }
 
+function Invoke-Adb {
+    param([string[]]$Arguments = @())
+    $prevErr = $ErrorActionPreference
+    $ErrorActionPreference = "SilentlyContinue"
+    try {
+        return & $Adb @Arguments 2>&1
+    } finally {
+        $ErrorActionPreference = $prevErr
+    }
+}
+
+function Get-MdnsPairingTarget {
+    $out = Invoke-Adb "mdns", "services"
+    foreach ($lineObj in @($out)) {
+        $line = [string]$lineObj
+        if ($line -notmatch "_adb-tls-pairing\._tcp") { continue }
+        $m = [regex]::Match($line, "(\d+\.\d+\.\d+\.\d+):(\d+)")
+        if ($m.Success) { return "$($m.Groups[1].Value):$($m.Groups[2].Value)" }
+    }
+    return ""
+}
+
 Write-Host ""
 Write-Host " Pa telefonen: Installningar -> Utvecklaralternativ -> Tradlos felsoekning" -ForegroundColor Cyan
 Write-Host " Tryck pa 'Parra enhet med parningskod'. Da visas adress (t.ex. 192.168.86.25:33127) och en 6-siffrig kod." -ForegroundColor Cyan
 Write-Host ""
 
-$pairPort = Read-Host " Ange PARNINGSPORTEN (siffrorna efter kolon, t.ex. 33127)"
+$mdnsTarget = Get-MdnsPairingTarget
+if ($mdnsTarget) {
+    Write-Host " Hittad parningsadress via mDNS: $mdnsTarget" -ForegroundColor Gray
+}
+
+$pairInput = Read-Host " Ange PARNINGSADRESSEN (IP:PORT) eller bara PORT"
 $code     = Read-Host " Ange den 6-siffriga KODEN"
 
-$pairPort = $pairPort.Trim()
+$pairInput = $pairInput.Trim()
 $code     = $code.Trim() -replace "\s", ""
 
-if (-not ($pairPort -match "^\d+$")) {
-    Write-Host " Ogiltig port." -ForegroundColor Red
-    exit 1
+if (-not $pairInput -and $mdnsTarget) {
+    $pairInput = $mdnsTarget
 }
 if (-not ($code -match "^\d{6}$")) {
     Write-Host " Koden ska vara exakt 6 siffror." -ForegroundColor Red
     exit 1
 }
 
-$ip = "192.168.86.25"
+$ip = ""
+$pairPort = ""
+if ($pairInput -match "^(\d+\.\d+\.\d+\.\d+):(\d+)$") {
+    $ip = $matches[1]
+    $pairPort = $matches[2]
+} elseif ($pairInput -match "^\d+$") {
+    $pairPort = $pairInput
+    if ($mdnsTarget -match "^(\d+\.\d+\.\d+\.\d+):\d+$") {
+        $ip = $matches[1]
+    } else {
+        $ip = (Read-Host " Ange telefonens IP (t.ex. 192.168.1.42)").Trim()
+    }
+}
+
+if (-not ($pairPort -match "^\d+$") -or $ip -notmatch "^\d+\.\d+\.\d+\.\d+$") {
+    Write-Host " Ogiltig adress. Anvaend formatet IP:PORT eller PORT + giltig IP." -ForegroundColor Red
+    exit 1
+}
+
 $target = "${ip}:${pairPort}"
 
 Write-Host ""
