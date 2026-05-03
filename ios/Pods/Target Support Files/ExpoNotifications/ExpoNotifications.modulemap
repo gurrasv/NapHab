@@ -1,6 +1,0 @@
-module ExpoNotifications {
-  umbrella header "ExpoNotifications-umbrella.h"
-
-  export *
-  module * { export * }
-}

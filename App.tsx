@@ -37,6 +37,7 @@ import {
   Easing,
   FlatList,
   Image,
+  ImageSourcePropType,
   LayoutAnimation,
   Modal,
   NativeScrollEvent,
@@ -133,6 +134,24 @@ type DiaryViewMode = 'tim' | 'dag' | 'manad';
 type WeekdayKey = 'mon' | 'tue' | 'wed' | 'thu' | 'fri' | 'sat' | 'sun';
 type LibraryExercise = { id: string; name: string; tags: string[]; primaryMuscle?: string; primarySubMuscles?: string[]; secondaryMuscles?: string[]; secondarySubMuscles?: Record<string, string[]> };
 type WizardMode = 'create' | 'edit';
+
+const EXERCISE_IMAGE_SOURCES: Partial<Record<string, ImageSourcePropType>> = {
+  'bench-press': require('./assets/exercise-images/bench-press-transparent.png'),
+  'cable-fly': require('./assets/exercise-images/cable-fly-transparent.png'),
+  'chest-press-machine': require('./assets/exercise-images/chest-press-machine-transparent.png'),
+  'close-grip-bench': require('./assets/exercise-images/close-grip-bench-transparent.png'),
+  'dips': require('./assets/exercise-images/dips-transparent.png'),
+  'dumbbell-flyes': require('./assets/exercise-images/dumbbell-flyes-transparent.png'),
+  'dumbbell-press': require('./assets/exercise-images/dumbbell-press-transparent.png'),
+  'incline-dumbbell-press': require('./assets/exercise-images/incline-dumbbell-press-transparent.png'),
+  snoanglar: require('./assets/exercise-images/snoanglar-transparent.png'),
+  'pec-deck': require('./assets/exercise-images/pec-deck-transparent.png'),
+  'push-up': require('./assets/exercise-images/push-up-transparent.png'),
+  lunges: require('./assets/exercise-images/utfallsteg-transparent.png'),
+  'smith-machine-press': require('./assets/exercise-images/smith-machine-press-transparent.png'),
+  'tricep-dip-machine': require('./assets/exercise-images/tricep-dip-machine-transparent.png'),
+  utfallsteg: require('./assets/exercise-images/utfallsteg-transparent.png'),
+};
 
 const Tab = createBottomTabNavigator();
 
@@ -932,7 +951,6 @@ const GYM_LIBRARY_EXERCISES: LibraryExercise[] = [
   { id: 'lat-pulldown', name: 'Latsdrag', tags: ['Rygg', 'Biceps', 'Maskin'], primaryMuscle: 'Rygg', primarySubMuscles: ['Latissimus dorsi'], secondaryMuscles: ['Biceps'] },
   { id: 'chest-press-machine', name: 'Bröstpress (maskin)', tags: ['Bröst', 'Triceps', 'Maskin'], primaryMuscle: 'Bröst', primarySubMuscles: ['Mellersta bröst'], secondaryMuscles: ['Triceps'] },
   { id: 'pec-deck', name: 'Pec deck / Butterfly', tags: ['Bröst', 'Maskin'], primaryMuscle: 'Bröst', secondaryMuscles: [] },
-  { id: 'cable-crossover', name: 'Cable crossover', tags: ['Bröst', 'Kabel'], primaryMuscle: 'Bröst', secondaryMuscles: [] },
   { id: 'cable-fly', name: 'Kabel flyes', tags: ['Bröst', 'Kabel'], primaryMuscle: 'Bröst', secondaryMuscles: [] },
   { id: 'smith-machine-press', name: 'Smith maskin press', tags: ['Axlar', 'Bröst', 'Maskin'], primaryMuscle: 'Axlar', primarySubMuscles: ['Främre deltoid'], secondaryMuscles: ['Bröst'] },
   { id: 'cable-lateral-raise', name: 'Kabel sidolyft', tags: ['Axlar', 'Kabel'], primaryMuscle: 'Axlar', primarySubMuscles: ['Sidodeltoid'], secondaryMuscles: [] },
@@ -1136,6 +1154,54 @@ const stripSeedEntries = (entries: PainEntry[], tag: string): PainEntry[] =>
   entries.filter(
     (entry) => !entry.id.startsWith(`${tag}-m-`) && !entry.id.startsWith(`${tag}-e-`),
   );
+
+function ExercisePreviewModal({
+  exercise,
+  onClose,
+  onEditCategory,
+}: {
+  exercise: LibraryExercise | null;
+  onClose: () => void;
+  onEditCategory: (exercise: LibraryExercise) => void;
+}) {
+  const imageSource = exercise ? EXERCISE_IMAGE_SOURCES[exercise.id] : undefined;
+  return (
+    <Modal visible={!!exercise} transparent animationType="fade" onRequestClose={onClose}>
+      <View style={styles.timePickerBackdrop}>
+        <View style={[styles.timePickerCard, styles.exercisePreviewCard]}>
+          <View style={styles.exercisePreviewHeader}>
+            <Text style={styles.exercisePreviewTitle}>{exercise?.name ?? ''}</Text>
+            <Pressable style={styles.exercisePreviewCloseButton} onPress={onClose}>
+              <MaterialIcons name="close" size={22} color="#DCE4EC" />
+            </Pressable>
+          </View>
+          <View style={styles.exercisePreviewImageFrame}>
+            {imageSource ? (
+              <Image source={imageSource} style={styles.exercisePreviewImage} resizeMode="contain" />
+            ) : (
+              <View style={styles.exercisePreviewPlaceholder}>
+                <MaterialCommunityIcons name="image-plus" size={36} color="#8FA1B3" />
+                <Text style={styles.exercisePreviewPlaceholderText}>Bild kommer snart</Text>
+              </View>
+            )}
+          </View>
+          {exercise ? (
+            <Button
+              mode="contained"
+              onPress={() => {
+                onClose();
+                requestAnimationFrame(() => onEditCategory(exercise));
+              }}
+              contentStyle={styles.exercisePreviewCategoryButton}
+            >
+              Redigera kategori för denna övning
+            </Button>
+          ) : null}
+        </View>
+      </View>
+    </Modal>
+  );
+}
 
 function HomeScreen({
   exercises,
@@ -1517,6 +1583,7 @@ function GymTrainingScreen({
   const [gymLibraryVisible, setGymLibraryVisible] = useState(false);
   const [gymLibraryQuery, setGymLibraryQuery] = useState('');
   const [gymLibraryFilter, setGymLibraryFilter] = useState<string | null>(null);
+  const [gymPreviewExercise, setGymPreviewExercise] = useState<LibraryExercise | null>(null);
   const [gymLibrarySubFilter, setGymLibrarySubFilter] = useState<string[]>([]);
   const [gymSubFilterDropdownOpen, setGymSubFilterDropdownOpen] = useState(false);
   const [gymLibraryEquipmentFilter, setGymLibraryEquipmentFilter] = useState<string | null>(null);
@@ -2467,6 +2534,7 @@ function GymTrainingScreen({
   const onGymLibraryModalClosed = useCallback(() => {
     setGymLibraryVisible(false);
     setGymCategoryEditorVisible(false);
+    setGymPreviewExercise(null);
     setLibraryMode(null);
   }, []);
 
@@ -4238,34 +4306,39 @@ function GymTrainingScreen({
             ListEmptyComponent: <Text style={styles.logEmpty}>Inga övningar matchar filtret.</Text>,
             renderItem: ({ item: exercise }) => (
               <View style={styles.libraryItem}>
-                <View style={styles.libraryItemMain}>
+                <Pressable style={styles.libraryItemTouchableMain} onPress={() => setGymPreviewExercise(exercise)}>
                   <Text style={styles.libraryName}>{exercise.name}</Text>
                   <View style={styles.libraryTagWrap}>
                     {exercise.tags.map((tag: string) => (
-                      <Pressable key={`${exercise.id}-${tag}`} style={styles.libraryTag} onPress={() => openGymCategoryEditor(exercise)}>
+                      <View key={`${exercise.id}-${tag}`} style={styles.libraryTag}>
                         <Text style={styles.libraryTagText}>{tag}</Text>
-                      </Pressable>
+                      </View>
                     ))}
                     {(exercise.primarySubMuscles ?? []).map((sub: string) => (
-                      <Pressable key={`${exercise.id}-psub-${sub}`} style={styles.libraryTagSub} onPress={() => openGymCategoryEditor(exercise)}>
+                      <View key={`${exercise.id}-psub-${sub}`} style={styles.libraryTagSub}>
                         <Text style={styles.libraryTagSubText}>{sub}</Text>
-                      </Pressable>
+                      </View>
                     ))}
                     {Object.entries(exercise.secondarySubMuscles ?? {} as Record<string, string[]>).flatMap(([, subs]) =>
                       (subs as string[]).map((sub: string) => (
-                        <Pressable key={`${exercise.id}-ssub-${sub}`} style={styles.libraryTagSub} onPress={() => openGymCategoryEditor(exercise)}>
+                        <View key={`${exercise.id}-ssub-${sub}`} style={styles.libraryTagSub}>
                           <Text style={styles.libraryTagSubText}>{sub}</Text>
-                        </Pressable>
+                        </View>
                       )),
                     )}
                   </View>
-                </View>
+                </Pressable>
                 <Button mode="contained" onPress={() => addLibraryExercise(exercise)} contentStyle={styles.libraryItemButton} labelStyle={{ fontSize: 11 }}>
                   Välj
                 </Button>
               </View>
             ),
           }}
+        />
+        <ExercisePreviewModal
+          exercise={gymPreviewExercise}
+          onClose={() => setGymPreviewExercise(null)}
+          onEditCategory={openGymCategoryEditor}
         />
         {gymCategoryEditorVisible && (
           <View style={styles.categoryEditorOverlay}>
@@ -8575,6 +8648,7 @@ export default function App() {
   const libraryModalRef = useRef<Modalize>(null);
   const [libraryQuery, setLibraryQuery] = useState('');
   const [libraryFilter, setLibraryFilter] = useState<string | null>(null);
+  const [libraryPreviewExercise, setLibraryPreviewExercise] = useState<LibraryExercise | null>(null);
   const [wizardExercise, setWizardExercise] = useState<LibraryExercise | null>(null);
   const [wizardMode, setWizardMode] = useState<WizardMode>('create');
   const [wizardExerciseId, setWizardExerciseId] = useState<string | null>(null);
@@ -9088,6 +9162,7 @@ export default function App() {
   const onLibraryModalClosed = useCallback(() => {
     setLibraryVisible(false);
     setRehabCategoryEditorVisible(false);
+    setLibraryPreviewExercise(null);
   }, []);
   const closeLibrarySheet = useCallback(() => {
     libraryModalRef.current?.close();
@@ -9657,28 +9732,28 @@ export default function App() {
             ListEmptyComponent: <Text style={styles.logEmpty}>Inga övningar matchar filtret.</Text>,
             renderItem: ({ item: exercise }) => (
               <View style={styles.libraryItem}>
-                <View style={styles.libraryItemMain}>
+                <Pressable style={styles.libraryItemTouchableMain} onPress={() => setLibraryPreviewExercise(exercise)}>
                   <Text style={styles.libraryName}>{exercise.name}</Text>
                   <View style={styles.libraryTagWrap}>
                     {exercise.tags.map((tag: string) => (
-                      <Pressable key={`${exercise.id}-${tag}`} style={styles.libraryTag} onPress={() => openRehabCategoryEditor(exercise)}>
+                      <View key={`${exercise.id}-${tag}`} style={styles.libraryTag}>
                         <Text style={styles.libraryTagText}>{tag}</Text>
-                      </Pressable>
+                      </View>
                     ))}
                     {(exercise.primarySubMuscles ?? []).map((sub: string) => (
-                      <Pressable key={`${exercise.id}-psub-${sub}`} style={styles.libraryTagSub} onPress={() => openRehabCategoryEditor(exercise)}>
+                      <View key={`${exercise.id}-psub-${sub}`} style={styles.libraryTagSub}>
                         <Text style={styles.libraryTagSubText}>{sub}</Text>
-                      </Pressable>
+                      </View>
                     ))}
                     {Object.entries(exercise.secondarySubMuscles ?? {} as Record<string, string[]>).flatMap(([, subs]) =>
                       (subs as string[]).map((sub: string) => (
-                        <Pressable key={`${exercise.id}-ssub-${sub}`} style={styles.libraryTagSub} onPress={() => openRehabCategoryEditor(exercise)}>
+                        <View key={`${exercise.id}-ssub-${sub}`} style={styles.libraryTagSub}>
                           <Text style={styles.libraryTagSubText}>{sub}</Text>
-                        </Pressable>
+                        </View>
                       )),
                     )}
                   </View>
-                </View>
+                </Pressable>
                 <Button
                   mode="contained"
                   onPress={() => {
@@ -9694,6 +9769,11 @@ export default function App() {
               </View>
             ),
           }}
+        />
+        <ExercisePreviewModal
+          exercise={libraryPreviewExercise}
+          onClose={() => setLibraryPreviewExercise(null)}
+          onEditCategory={openRehabCategoryEditor}
         />
         {rehabCategoryEditorVisible && (
           <View style={styles.categoryEditorOverlay}>
@@ -10605,6 +10685,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   libraryItemMain: { flex: 1, gap: 4 },
+  libraryItemTouchableMain: { flex: 1, gap: 4, alignSelf: 'stretch', justifyContent: 'center' },
   libraryName: { color: '#E3EAF2', fontSize: 15, fontWeight: '700' },
   libraryTagWrap: { flexDirection: 'row', flexWrap: 'wrap', gap: 4 },
   libraryTag: { borderRadius: 999, backgroundColor: '#2B3A48', paddingHorizontal: 8, paddingVertical: 4 },
@@ -10702,6 +10783,33 @@ const styles = StyleSheet.create({
     paddingBottom: 8,
   },
   timePickerTitle: { color: '#FFFFFF', fontSize: 18, fontWeight: '700', textAlign: 'center', marginBottom: 8 },
+  exercisePreviewCard: { width: '100%', maxWidth: 520, alignSelf: 'center', gap: 12 },
+  exercisePreviewHeader: { minHeight: 32, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', paddingHorizontal: 38 },
+  exercisePreviewTitle: { color: '#FFFFFF', fontSize: 18, fontWeight: '800', textAlign: 'center' },
+  exercisePreviewCloseButton: {
+    position: 'absolute',
+    right: 0,
+    top: 0,
+    width: 34,
+    height: 34,
+    borderRadius: 8,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#1E2A36',
+  },
+  exercisePreviewImageFrame: {
+    width: '100%',
+    aspectRatio: 1.5,
+    borderRadius: 10,
+    overflow: 'hidden',
+    backgroundColor: '#182430',
+    borderWidth: 1,
+    borderColor: '#2B3A48',
+  },
+  exercisePreviewImage: { width: '100%', height: '100%' },
+  exercisePreviewPlaceholder: { flex: 1, alignItems: 'center', justifyContent: 'center', gap: 8 },
+  exercisePreviewPlaceholderText: { color: '#A8BACB', fontSize: 14, fontWeight: '700' },
+  exercisePreviewCategoryButton: { minHeight: 42 },
   confirmBody: { color: '#A8BACB', fontSize: 15, textAlign: 'center', lineHeight: 22, marginBottom: 12 },
   confirmActions: { marginTop: 8, flexDirection: 'row', justifyContent: 'center', gap: 16 },
   timePickerActions: { marginTop: 4, flexDirection: 'row', justifyContent: 'flex-end', gap: 8 },
